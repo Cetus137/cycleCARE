@@ -294,6 +294,10 @@ def validate(model, val_loader, loss_manager, epoch, config, writer=None):
         'cycle_B': AverageMeter()
     }
     
+    # Select a random batch index for saving sample images
+    import random
+    save_sample_idx = random.randint(0, len(val_loader) - 1) if epoch % config.SAVE_SAMPLE_FREQ == 0 else -1
+    
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             real_A = batch['A'].to(config.DEVICE, non_blocking=True)
@@ -313,8 +317,8 @@ def validate(model, val_loader, loss_manager, epoch, config, writer=None):
             meters['cycle_A'].update(cycle_loss_A.item())
             meters['cycle_B'].update(cycle_loss_B.item())
             
-            # Save sample images
-            if i == 0 and epoch % config.SAVE_SAMPLE_FREQ == 0:
+            # Save sample images from a random batch each epoch
+            if i == save_sample_idx:
                 save_path = config.SAMPLE_DIR / f'epoch_{epoch:04d}.tif'
                 save_comparison_grid(
                     real_A, outputs['fake_B'], outputs['reconstructed_A'],
@@ -323,7 +327,7 @@ def validate(model, val_loader, loss_manager, epoch, config, writer=None):
                     mean=config.NORMALIZE_MEAN,
                     std=config.NORMALIZE_STD
                 )
-                print(f"Saved sample images to {save_path}")
+                print(f"Saved sample images to {save_path} (batch {i+1}/{len(val_loader)})")
     
     val_losses = {key: meter.avg for key, meter in meters.items()}
     print(f"Validation - Cycle A: {val_losses['cycle_A']:.4f}, Cycle B: {val_losses['cycle_B']:.4f}")
