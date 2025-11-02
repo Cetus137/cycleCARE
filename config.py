@@ -13,14 +13,14 @@ class Config:
     
     # ==================== Paths ====================
     # Data directories - use absolute paths on HPC
-    DATA_ROOT = Path("./data")
+    DATA_ROOT = Path("/Users/ewheeler/cycleCARE/data")
     
     # Two modes supported:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT / "clean"   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT / "noisy"   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT / "z100_z105_tiles/T0_C0"   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT / "z220_z225_tiles/T0_C0"   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
@@ -37,8 +37,15 @@ class Config:
     
     # ==================== Model Architecture ====================
     # Generator (CARE-style U-Net)
-    IMG_CHANNELS = 1          # Number of image channels (1 for grayscale TIF, 3 for RGB)
-    UNET_DEPTH = 2            # Depth of U-Net (2 for 128x128: 128→64→32, then back up)
+    
+    # Z-stack context settings
+    ZSTACK_CONTEXT = 5        # Number of adjacent Z-planes to use as input (1 = single plane, 3/5/7 = multi-plane)
+    ZSTACK_MODE = True       # Enable Z-stack context mode (uses multi-plane input)
+    
+    # IMG_CHANNELS automatically set based on ZSTACK_CONTEXT if ZSTACK_MODE is True
+    IMG_CHANNELS = ZSTACK_CONTEXT if ZSTACK_MODE else 1  # Input channels (1 for single plane, N for Z-context)
+    
+    UNET_DEPTH = 3            # Depth of U-Net (2 for 128x128: 128→64→32, then back up)
     UNET_FILTERS = 64         # Number of filters in first layer (doubles with each layer)
     UNET_KERNEL_SIZE = 3      # Kernel size for convolutions
     USE_DROPOUT = True        # Use dropout in U-Net

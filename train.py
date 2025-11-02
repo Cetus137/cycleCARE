@@ -4,6 +4,9 @@ Includes mixed precision training, gradient accumulation, and multi-GPU support.
 """
 
 import os
+# Fix for macOS OpenMP library conflict
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import time
 import torch
 import torch.nn as nn
@@ -20,6 +23,30 @@ from utils.helpers import (
     get_learning_rate, update_learning_rate, set_requires_grad,
     ImagePool, AverageMeter, print_training_info
 )
+
+
+def config_to_dict(config):
+    """
+    Convert Config object to dictionary for safe checkpoint saving.
+    
+    Args:
+        config: Configuration object with class-level attributes
+    
+    Returns:
+        Dictionary containing all configuration values
+    """
+    config_dict = {}
+    
+    # Get all public attributes from the config class
+    for attr in dir(config):
+        if not attr.startswith('_') and not callable(getattr(config, attr)):
+            value = getattr(config, attr)
+            # Convert Path objects to strings for serialization
+            if isinstance(value, Path):
+                value = str(value)
+            config_dict[attr] = value
+    
+    return config_dict
 
 
 def setup_training(config):
@@ -436,7 +463,7 @@ def train(config):
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
-                'config': config
+                'config': config_to_dict(config)  # Save as dict for proper serialization
             }, checkpoint_path)
         
         # Save best model
@@ -456,7 +483,7 @@ def train(config):
                 'optimizer_D_B_state_dict': optimizers['D_B'].state_dict(),
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
-                'config': config
+                'config': config_to_dict(config)  # Save as dict for proper serialization
             }, best_model_path)
             print(f"✓ New best model saved! (val cycle_B loss: {best_val_loss:.4f})")
         
