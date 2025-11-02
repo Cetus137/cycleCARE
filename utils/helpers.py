@@ -81,7 +81,7 @@ def tensor_to_image(tensor, mean=0.5, std=0.5):
     Convert a tensor to a PIL Image.
     
     Args:
-        tensor (torch.Tensor): Image tensor of shape (C, H, W) or (B, C, H, W)
+        tensor (torch.Tensor): Image tensor (C, H, W) or (1, C, H, W)
         mean (float): Mean used for normalization
         std (float): Std used for normalization
     
@@ -92,6 +92,12 @@ def tensor_to_image(tensor, mean=0.5, std=0.5):
     if tensor.dim() == 4:
         tensor = tensor[0]
     
+    # Handle multi-channel Z-stack inputs (e.g., 5 channels from Z-context)
+    # Display only the center channel (main plane being processed)
+    if tensor.size(0) > 1:
+        center_channel = tensor.size(0) // 2
+        tensor = tensor[center_channel:center_channel+1]  # Keep as [1, H, W]
+    
     # Denormalize
     tensor = denormalize(tensor, mean, std)
     
@@ -99,23 +105,18 @@ def tensor_to_image(tensor, mean=0.5, std=0.5):
     array = tensor.cpu().numpy()
     
     # Transpose to (H, W, C) if needed
-    if array.shape[0] in [1, 3]:
+    if array.shape[0] == 1:
         array = np.transpose(array, (1, 2, 0))
     
-    # Squeeze if grayscale
-    if array.shape[2] == 1:
+    # Squeeze to (H, W) for grayscale
+    if len(array.shape) == 3 and array.shape[2] == 1:
         array = array.squeeze(2)
     
     # Convert to uint8
     array = (array * 255).astype(np.uint8)
     
-    # Convert to PIL Image
-    if len(array.shape) == 2:  # Grayscale
-        image = Image.fromarray(array, mode='L')
-    else:  # RGB
-        image = Image.fromarray(array, mode='RGB')
-    
-    return image
+    # Convert to PIL Image (always grayscale)
+    image = Image.fromarray(array, mode='L')
 
 
 def save_image(tensor, path, mean=0.5, std=0.5):

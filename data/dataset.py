@@ -187,13 +187,12 @@ class UnpairedMicroscopyDataset(Dataset):
             # Convert float [0, 1] to uint8 [0, 255] for PIL
             img_array = (img_array * 255).astype(np.uint8)
         
-        # Ensure proper mode
-        if len(img_array.shape) == 2:  # Grayscale
-            img = Image.fromarray(img_array, mode='L')
-        elif len(img_array.shape) == 3 and img_array.shape[2] == 3:  # RGB
-            img = Image.fromarray(img_array, mode='RGB')
-        else:
-            img = Image.fromarray(img_array)
+        # Convert to grayscale PIL Image
+        if len(img_array.shape) == 3:
+            # If multi-dimensional, take first channel or mean
+            img_array = img_array[..., 0] if img_array.shape[2] == 1 else np.mean(img_array, axis=2).astype(np.uint8)
+        
+        img = Image.fromarray(img_array, mode='L')
         
         # Apply transforms (ToTensor converts to [0, 1], then Normalize converts to [-1, 1])
         img = self.transform(img)
@@ -507,14 +506,12 @@ class InferenceMicroscopyDataset(Dataset):
             # 16-bit TIFF - normalize to [0, 1] then to uint8
             img_array = (img_array.astype(np.float32) / 65535.0 * 255).astype(np.uint8)
         
-        # Convert to PIL
-        if len(img_array.shape) == 2:
-            img = Image.fromarray(img_array, mode='L')
-        elif len(img_array.shape) == 3:
-            img = Image.fromarray(img_array, mode='RGB')
-        else:
-            if img.mode != 'L' and img.mode != 'RGB':
-                img = img.convert('L')
+        # Convert to grayscale PIL Image
+        if len(img_array.shape) == 3:
+            # If multi-dimensional, take first channel or mean
+            img_array = img_array[..., 0] if img_array.shape[2] == 1 else np.mean(img_array, axis=2).astype(np.uint8)
+        
+        img = Image.fromarray(img_array, mode='L')
         
         img = self.transform(img)
         return img

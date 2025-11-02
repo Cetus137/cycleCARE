@@ -14,13 +14,95 @@ from pathlib import Path
 import torchvision.transforms as transforms
 try:
     import tifffile
+    HAS_TIFFFILE = True
 except ImportError:
+    HAS_TIFFFILE = False
     tifffile = None
+    print("Warning: tifffile not available. Using PIL fallback for TIFF I/O.")
+except Exception as e:
+    HAS_TIFFFILE = False
+    tifffile = None
+    print(f"Warning: tifffile import failed ({e}). Using PIL fallback for TIFF I/O.")
 from tqdm import tqdm
 
 
+def _load_tiff_array(file_path):
+    """
+    Load a TIFF file as numpy array with fallback support.
+    Supports both single and multi-page TIFFs.
+    
+    Args:
+        file_path: Path to TIFF file
+    
+    Returns:
+        numpy.ndarray: Array with shape (H, W) or (N, H, W)
+    """
+    if HAS_TIFFFILE:
+        try:
+            return tifffile.imread(file_path)
+        except Exception as e:
+            print(f"Warning: tifffile.imread failed: {e}")
+            print("Falling back to PIL...")
+    
+    # Fallback to PIL
+    img = Image.open(file_path)
+    
+    # Check if multi-page
+    try:
+        n_frames = img.n_frames
+    except AttributeError:
+        n_frames = 1
+    
+    if n_frames == 1:
+        # Single page
+        return np.array(img)
+    else:
+        # Multi-page TIFF
+        planes = []
+        for i in range(n_frames):
+            img.seek(i)
+            planes.append(np.array(img))
+        return np.stack(planes, axis=0)  # Shape: (N, H, W)
+
+
+def _save_tiff_array(file_path, array):
+    """
+    Save numpy array as TIFF with fallback support.
+    
+    Args:
+        file_path: Path to save TIFF file
+        array: numpy array with shape (H, W) or (N, H, W)
+    """
+    if HAS_TIFFFILE:
+        try:
+            tifffile.imwrite(file_path, array)
+            return
+        except Exception as e:
+            print(f"Warning: tifffile.imwrite failed: {e}")
+            print("Falling back to PIL...")
+    
+    # Fallback to PIL
+    if len(array.shape) == 2:
+        # Single plane
+        img = Image.fromarray(array)
+        img.save(file_path)
+    elif len(array.shape) == 3:
+        # Multi-page TIFF
+        images = [Image.fromarray(array[i]) for i in range(array.shape[0])]
+        images[0].save(file_path, save_all=True, append_images=images[1:])
+    else:
+        raise ValueError(f"Cannot save array with shape {array.shape}")
+
+
 def load_model(checkpoint_path, device='cuda'):
-    """Load the trained model from checkpoint."""
+    """
+    Load the trained model from checkpoint.
+    
+    Returns:
+        tuple: (model, zstack_context)
+            - model: Loaded CycleCARE model
+            - zstack_context: Number of Z-planes used (1 for single-plane, 3/5/7 for multi-plane)
+    """
     from models import CycleCARE
     
     # Load checkpoint
@@ -38,13 +120,19 @@ def load_model(checkpoint_path, device='cuda'):
             unet_depth = cfg.get('UNET_DEPTH', 2)
             unet_filters = cfg.get('UNET_FILTERS', 64)
             img_channels = cfg.get('IMG_CHANNELS', 1)
-            print(f"Loaded config from checkpoint (dict): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}")
+            zstack_context = cfg.get('ZSTACK_CONTEXT', img_channels)  # For backward compat
+            print(f"Loaded config from checkpoint (dict): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
+            if zstack_context > 1:
+                print(f"  Z-stack mode: {zstack_context}-plane context")
         else:
             # Old format: Config object with class-level attributes
             unet_depth = getattr(cfg, 'UNET_DEPTH', 2)
             unet_filters = getattr(cfg, 'UNET_FILTERS', 64)
             img_channels = getattr(cfg, 'IMG_CHANNELS', 1)
-            print(f"Loaded config from checkpoint (object): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}")
+            zstack_context = getattr(cfg, 'ZSTACK_CONTEXT', img_channels)
+            print(f"Loaded config from checkpoint (object): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
+            if zstack_context > 1:
+                print(f"  Z-stack mode: {zstack_context}-plane context")
             print("  WARNING: Old checkpoint format detected. Config may not reflect actual training settings.")
             print("  Verifying against model weights...")
             
@@ -88,8 +176,9 @@ def load_model(checkpoint_path, device='cuda'):
             unet_filters = 64  # default
         
         img_channels = 1  # default for grayscale
+        zstack_context = img_channels  # Assume Z-stack context equals img_channels
         
-        print(f"Inferred architecture: UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}")
+        print(f"Inferred architecture: UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
     
     # Create model
     model = CycleCARE(
@@ -110,7 +199,7 @@ def load_model(checkpoint_path, device='cuda'):
     model.eval()
     
     print(f"✓ Model loaded successfully from {checkpoint_path}")
-    return model
+    return model, zstack_context
 
 
 def preprocess_image(image_array):
@@ -268,11 +357,11 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
     img = Image.open(image_path)
     img_array = np.array(img)
     
-    # Get original dimensions
+    # Get original dimensions and ensure grayscale
     if len(img_array.shape) == 3:
         h, w, c = img_array.shape
         if c > 1:
-            print("Warning: Converting RGB to grayscale")
+            print("Warning: Converting multi-channel to grayscale")
             img_array = np.mean(img_array, axis=2).astype(img_array.dtype)
     else:
         h, w = img_array.shape
@@ -329,12 +418,7 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
     
     # Save as float32 TIFF (preserves full precision) or convert to uint8/uint16 for other formats
     if output_path.suffix.lower() in ['.tif', '.tiff']:
-        if tifffile is not None:
-            tifffile.imwrite(output_path, restored)
-        else:
-            # Fallback: convert to uint16 for PIL
-            restored_uint16 = (restored * 65535).astype(np.uint16)
-            Image.fromarray(restored_uint16).save(output_path)
+        _save_tiff_array(output_path, restored)
     else:
         # For PNG, JPG etc: convert to uint8
         restored_uint8 = (restored * 255).astype(np.uint8)
@@ -345,9 +429,93 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
     return restored  # Return float32 array
 
 
-def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128):
+def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, overlap=16):
     """
-    Restore a Z-stack by processing each plane independently.
+    Helper function to denoise a multi-channel input with tiling.
+    
+    Args:
+        stacked_input: [N_channels, H, W] tensor (could be multi-plane context)
+        model: CycleCARE model
+        device: Device to use
+        tile_size: Tile size for processing
+        overlap: Overlap between tiles
+    
+    Returns:
+        Restored image as float32 numpy array [H, W]
+    """
+    n_channels, h, w = stacked_input.shape
+    
+    # Create tile grid
+    stride = tile_size - overlap
+    tiles = []
+    positions = []
+    
+    for y in range(0, h, stride):
+        for x in range(0, w, stride):
+            y_end = min(y + tile_size, h)
+            x_end = min(x + tile_size, w)
+            
+            # Extract tile from all channels
+            tile = stacked_input[:, y:y_end, x:x_end]  # [N_channels, tile_h, tile_w]
+            
+            # Pad if necessary
+            tile_h, tile_w = tile.shape[1], tile.shape[2]
+            if tile_h < tile_size or tile_w < tile_size:
+                padded = torch.zeros((n_channels, tile_size, tile_size), dtype=tile.dtype)
+                padded[:, :tile_h, :tile_w] = tile
+                tile = padded
+            
+            tiles.append(tile)
+            positions.append((y, x, y_end, x_end))
+    
+    # Process tiles
+    restored_tiles = []
+    for tile in tiles:
+        tile_batch = tile.unsqueeze(0).to(device)  # [1, N_channels, H, W]
+        
+        with torch.no_grad():
+            restored_tensor = model.restore(tile_batch)
+        
+        restored_tile = postprocess_image(restored_tensor[0])
+        restored_tiles.append(restored_tile)
+    
+    # Stitch tiles
+    output = np.zeros((h, w), dtype=np.float32)
+    weights = np.zeros((h, w), dtype=np.float32)
+    
+    for tile, (y, x, y_end, x_end) in zip(restored_tiles, positions):
+        tile_h = y_end - y
+        tile_w = x_end - x
+        tile_crop = tile[:tile_h, :tile_w]
+        
+        # Create weight map with soft edges
+        tile_weights = np.ones((tile_h, tile_w), dtype=np.float32)
+        
+        if overlap > 0:
+            if y > 0:
+                tile_weights[:overlap, :] *= np.linspace(0, 1, overlap)[:, np.newaxis]
+            if y_end < h:
+                tile_weights[-overlap:, :] *= np.linspace(1, 0, overlap)[:, np.newaxis]
+            if x > 0:
+                tile_weights[:, :overlap] *= np.linspace(0, 1, overlap)
+            if x_end < w:
+                tile_weights[:, -overlap:] *= np.linspace(1, 0, overlap)
+        
+        output[y:y_end, x:x_end] += tile_crop * tile_weights
+        weights[y:y_end, x:x_end] += tile_weights
+    
+    weights = np.maximum(weights, 1e-8)
+    output = output / weights
+    
+    return output.astype(np.float32)
+
+
+def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128, zstack_context=1):
+    """
+    Restore a Z-stack using multi-plane context if model was trained with it.
+    
+    If zstack_context > 1, uses sliding window of N adjacent planes as input
+    to denoise each plane, exploiting 3D spatial coherence.
     
     Args:
         model: Trained CycleCARE model
@@ -355,31 +523,19 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
         output_path: Path to save restored Z-stack (saved as float32 TIFF if tifffile available)
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size for tiling (default 128)
+        zstack_context: Number of adjacent planes to use as input (1 = single plane, 5 = use 5-plane context)
     
     Returns:
         Restored Z-stack as float32 numpy array (Z, H, W) in [0, 1] range
     """
     print(f"\nProcessing Z-stack: {zstack_path}")
     
-    # Try to load as multi-page TIFF
+    if zstack_context > 1:
+        print(f"  Using {zstack_context}-plane context window")
+    
+    # Load as multi-page TIFF (uses fallback if tifffile unavailable)
     try:
-        # Try tifffile first (better for scientific images)
-        try:
-            import tifffile
-            zstack = tifffile.imread(zstack_path)
-        except ImportError:
-            # Fallback to PIL
-            img = Image.open(zstack_path)
-            planes = []
-            try:
-                i = 0
-                while True:
-                    img.seek(i)
-                    planes.append(np.array(img))
-                    i += 1
-            except EOFError:
-                pass
-            zstack = np.array(planes)
+        zstack = _load_tiff_array(zstack_path)
     except Exception as e:
         print(f"Error loading Z-stack: {e}")
         print("Treating as single plane image")
@@ -403,45 +559,69 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     
     # Process each plane
     restored_planes = []
+    half_context = zstack_context // 2
     
     print(f"  Processing {num_planes} plane(s)...")
     for z in tqdm(range(num_planes), desc="Denoising planes"):
-        plane = zstack[z]
         
-        # Get dimensions
-        if len(plane.shape) == 3:
-            h, w, c = plane.shape
-            if c > 1:
-                plane = np.mean(plane, axis=2).astype(plane.dtype)
+        if zstack_context > 1:
+            # Load context planes (sliding window)
+            context_planes = []
+            for dz in range(-half_context, half_context + 1):
+                z_actual = np.clip(z + dz, 0, num_planes - 1)  # Reflect at edges
+                plane_ctx = zstack[z_actual]
+                
+                # Get dimensions and convert to grayscale if needed
+                if len(plane_ctx.shape) == 3:
+                    h, w, c = plane_ctx.shape
+                    if c > 1:
+                        plane_ctx = np.mean(plane_ctx, axis=2).astype(plane_ctx.dtype)
+                else:
+                    h, w = plane_ctx.shape
+                
+                context_planes.append(plane_ctx)
+            
+            # Stack context planes: [zstack_context, H, W]
+            # Each plane preprocessed individually, then stacked
+            context_tensors = []
+            for plane_ctx in context_planes:
+                tensor_ctx = preprocess_image(plane_ctx)  # Returns [1, H, W]
+                context_tensors.append(tensor_ctx)
+            
+            # Stack to [zstack_context, H, W]
+            stacked_input = torch.cat(context_tensors, dim=0)
+            
         else:
-            h, w = plane.shape
+            # Single plane mode (backward compatibility)
+            plane = zstack[z]
+            
+            # Get dimensions
+            if len(plane.shape) == 3:
+                h, w, c = plane.shape
+                if c > 1:
+                    plane = np.mean(plane, axis=2).astype(plane.dtype)
+            else:
+                h, w = plane.shape
+            
+            stacked_input = preprocess_image(plane)  # [1, H, W]
         
         # Check if tiling is needed
+        _, h, w = stacked_input.shape  # Get dimensions from tensor
+        
         if h <= tile_size and w <= tile_size:
             # Direct processing
-            tensor = preprocess_image(plane)
-            tensor = tensor.unsqueeze(0).to(device)
+            input_batch = stacked_input.unsqueeze(0).to(device)  # Add batch dim: [1, N, H, W]
             
             with torch.no_grad():
-                restored_tensor = model.restore(tensor)
+                restored_tensor = model.restore(input_batch)
             
             restored_plane = postprocess_image(restored_tensor[0])
         else:
-            # Tiled processing
-            tiles, positions, original_shape = tile_image(plane, tile_size=tile_size, overlap=16)
-            
-            restored_tiles = []
-            for tile in tiles:
-                tensor = preprocess_image(tile)
-                tensor = tensor.unsqueeze(0).to(device)
-                
-                with torch.no_grad():
-                    restored_tensor = model.restore(tensor)
-                
-                restored_tile = postprocess_image(restored_tensor[0])
-                restored_tiles.append(restored_tile)
-            
-            restored_plane = stitch_tiles(restored_tiles, positions, original_shape, overlap=16)
+            # Tiled processing with context
+            # Need to tile all context planes together
+            restored_plane = _denoise_with_tiling_and_context(
+                stacked_input, model, device, tile_size, overlap=16
+            )
         
         restored_planes.append(restored_plane)
     
@@ -453,27 +633,16 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     if num_planes == 1:
-        # Single plane - save with same logic as restore_image
+        # Single plane
         if output_path.suffix.lower() in ['.tif', '.tiff']:
-            if tifffile is not None:
-                tifffile.imwrite(output_path, restored_zstack[0])
-            else:
-                # Fallback: convert to uint16 for PIL
-                restored_uint16 = (restored_zstack[0] * 65535).astype(np.uint16)
-                Image.fromarray(restored_uint16).save(output_path)
+            _save_tiff_array(output_path, restored_zstack[0])
         else:
             # For PNG, JPG etc: convert to uint8
             restored_uint8 = (restored_zstack[0] * 255).astype(np.uint8)
             Image.fromarray(restored_uint8).save(output_path)
     else:
-        # Z-stack - save as multi-page TIFF (always float32 with tifffile, or uint16 fallback)
-        if tifffile is not None:
-            tifffile.imwrite(output_path, restored_zstack)
-        else:
-            # Fallback: convert to uint16 for PIL multi-page TIFF
-            restored_uint16 = (restored_zstack * 65535).astype(np.uint16)
-            images = [Image.fromarray(plane) for plane in restored_uint16]
-            images[0].save(output_path, save_all=True, append_images=images[1:])
+        # Z-stack - save as multi-page TIFF
+        _save_tiff_array(output_path, restored_zstack)
     
     print(f"  ✓ Saved to: {output_path}")
     
@@ -504,7 +673,14 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
     device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    model = load_model(checkpoint_path, device=device)
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    
+    # Warn if model expects Z-stack but single image provided
+    if zstack_context > 1:
+        print(f"⚠️  Model was trained with {zstack_context}-plane Z-stack context.")
+        print(f"   For single 2D images, output may be suboptimal.")
+        print(f"   Consider using denoise_zstack() for best results.")
+    
     restored = restore_image(model, input_path, output_path, device=device, tile_size=tile_size)
     
     print("✓ Done!")
@@ -535,8 +711,8 @@ def denoise_zstack(checkpoint_path, input_path, output_path, device='cuda', tile
     device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    model = load_model(checkpoint_path, device=device)
-    restored = restore_zstack(model, input_path, output_path, device=device, tile_size=tile_size)
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    restored = restore_zstack(model, input_path, output_path, device=device, tile_size=tile_size, zstack_context=zstack_context)
     
     print("✓ Done!")
     return restored
@@ -578,7 +754,11 @@ def denoise_batch(checkpoint_path, input_dir, output_dir, device='cuda', tile_si
     print(f"Found {len(files)} file(s) to process")
     
     # Load model once
-    model = load_model(checkpoint_path, device=device)
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    
+    if zstack_context > 1:
+        print(f"⚠️  Model was trained with {zstack_context}-plane Z-stack context.")
+        print(f"   For best results, use denoise_zstack() for Z-stack files.")
     
     # Process each file
     for i, input_path in enumerate(files, 1):

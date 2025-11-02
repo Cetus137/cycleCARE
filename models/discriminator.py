@@ -176,18 +176,6 @@ def test_discriminator():
     for i, out in enumerate(outputs):
         print(f"   Scale {i+1} output shape: {out.shape}")
     print("   ✓ Test passed!")
-    
-    # Test with RGB images
-    print("\n3. RGB PatchGAN:")
-    disc_rgb = PatchGANDiscriminator(in_channels=3, base_filters=64, num_layers=3)
-    print(f"   Parameters: {disc_rgb.count_parameters():,}")
-    
-    x_rgb = torch.randn(batch_size, 3, img_size, img_size)
-    y_rgb = disc_rgb(x_rgb)
-    
-    print(f"   Input shape: {x_rgb.shape}")
-    print(f"   Output shape: {y_rgb.shape}")
-    print("   ✓ Test passed!")
 
 
 if __name__ == "__main__":
