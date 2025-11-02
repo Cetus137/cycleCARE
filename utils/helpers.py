@@ -117,6 +117,7 @@ def tensor_to_image(tensor, mean=0.5, std=0.5):
     
     # Convert to PIL Image (always grayscale)
     image = Image.fromarray(array, mode='L')
+    return image
 
 
 def save_image(tensor, path, mean=0.5, std=0.5):
@@ -159,46 +160,101 @@ def save_comparison_grid(real_A, fake_B, reconstructed_A, real_B, fake_A, recons
     # Create figure
     fig, axes = plt.subplots(2, 3, figsize=(12, 8))
     
-    # Convert tensors to images
+    # Convert tensors to numpy arrays
     def to_img(tensor, idx):
-        return tensor_to_image(tensor[idx].unsqueeze(0), mean, std)
+        """Convert tensor to numpy array for visualization."""
+        t = tensor[idx].unsqueeze(0)  # [1, C, H, W]
+        
+        # Handle batch dimension
+        if t.dim() == 4:
+            t = t[0]  # [C, H, W]
+        
+        # Handle multi-channel Z-stack inputs - display center channel
+        if t.size(0) > 1:
+            center_channel = t.size(0) // 2
+            t = t[center_channel:center_channel+1]  # [1, H, W]
+        
+        # Denormalize to [0, 1]
+        t = denormalize(t, mean, std)
+        
+        # Convert to numpy [H, W] as float32
+        array = t.cpu().numpy().astype(np.float32)
+        if array.shape[0] == 1:
+            array = array.squeeze(0)  # Remove channel dim for grayscale
+        
+        return array
     
-    # Plot images for first sample
+    # Extract all images and print diagnostics
     idx = 0
+    img_real_A = to_img(real_A, idx)
+    img_fake_B = to_img(fake_B, idx)
+    img_recon_A = to_img(reconstructed_A, idx)
+    img_real_B = to_img(real_B, idx)
+    img_fake_A = to_img(fake_A, idx)
+    img_recon_B = to_img(reconstructed_B, idx)
+    
+    # Print value ranges for diagnostics
+    print(f"  Image value ranges after denormalization:")
+    for name, img in [('real_A', img_real_A), ('fake_B', img_fake_B), ('fake_A', img_fake_A),
+                      ('real_B', img_real_B), ('recon_A', img_recon_A), ('recon_B', img_recon_B)]:
+        print(f"    {name}: min={img.min():.4f}, max={img.max():.4f}, mean={img.mean():.4f}")
+    
+    # Helper to display with adaptive contrast for low-contrast images
+    def show_img(ax, img, title, use_adaptive=False):
+        """Display image with optional adaptive contrast."""
+        if use_adaptive and (img.max() - img.min()) < 0.3:
+            # Use adaptive contrast for low-contrast generated images
+            vmin, vmax = np.percentile(img, [1, 99])
+            title_range = f'\n[{vmin:.3f}, {vmax:.3f}]'
+        else:
+            vmin, vmax = 0, 1
+            title_range = ''
+        
+        ax.imshow(img, cmap='gray', vmin=vmin, vmax=vmax)
+        ax.set_title(title + title_range, fontsize=10)
+        ax.axis('off')
     
     # Top row: A -> B -> A cycle
-    axes[0, 0].imshow(to_img(real_A, idx), cmap='gray' if real_A.size(1) == 1 else None)
-    axes[0, 0].set_title('Real A (Clean)')
-    axes[0, 0].axis('off')
-    
-    axes[0, 1].imshow(to_img(fake_B, idx), cmap='gray' if fake_B.size(1) == 1 else None)
-    axes[0, 1].set_title('Fake B (A→B)')
-    axes[0, 1].axis('off')
-    
-    axes[0, 2].imshow(to_img(reconstructed_A, idx), cmap='gray' if reconstructed_A.size(1) == 1 else None)
-    axes[0, 2].set_title('Reconstructed A')
-    axes[0, 2].axis('off')
+    show_img(axes[0, 0], img_real_A, 'Real A (Clean)', use_adaptive=False)
+    show_img(axes[0, 1], img_fake_B, 'Fake B (A→B)', use_adaptive=True)
+    show_img(axes[0, 2], img_recon_A, 'Reconstructed A', use_adaptive=True)
     
     # Bottom row: B -> A -> B cycle
-    axes[1, 0].imshow(to_img(real_B, idx), cmap='gray' if real_B.size(1) == 1 else None)
-    axes[1, 0].set_title('Real B (Noisy)')
-    axes[1, 0].axis('off')
-    
-    axes[1, 1].imshow(to_img(fake_A, idx), cmap='gray' if fake_A.size(1) == 1 else None)
-    axes[1, 1].set_title('Fake A (B→A, Restored)')
-    axes[1, 1].axis('off')
-    
-    axes[1, 2].imshow(to_img(reconstructed_B, idx), cmap='gray' if reconstructed_B.size(1) == 1 else None)
-    axes[1, 2].set_title('Reconstructed B')
-    axes[1, 2].axis('off')
+    show_img(axes[1, 0], img_real_B, 'Real B (Noisy)', use_adaptive=False)
+    show_img(axes[1, 1], img_fake_A, 'Fake A (B→A, Restored)', use_adaptive=True)
+    show_img(axes[1, 2], img_recon_B, 'Reconstructed B', use_adaptive=True)
     
     plt.tight_layout()
     
-    # Save
+    # Save paths
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    # Save PNG visualization
+    png_path = save_path.with_suffix('.png')
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
     plt.close()
+    
+    # Save 32-bit float TIFF with all 6 images
+    # Stack order: [real_A, fake_B, recon_A, real_B, fake_A, recon_B]
+    try:
+        import tifffile
+        
+        # Stack all images into (6, H, W) array
+        stack = np.stack([img_real_A, img_fake_B, img_recon_A, 
+                         img_real_B, img_fake_A, img_recon_B], axis=0).astype(np.float32)
+        
+        # Save as 32-bit float TIFF
+        tiff_path = save_path.with_suffix('.tif')
+        tifffile.imwrite(tiff_path, stack, photometric='minisblack', 
+                        metadata={'axes': 'ZYX', 'description': 
+                                 'Stack order: real_A, fake_B, recon_A, real_B, fake_A, recon_B'})
+        print(f"  Saved 32-bit float TIFF: {tiff_path}")
+        
+    except ImportError:
+        print("  Warning: tifffile not available, skipping TIFF save")
+    except Exception as e:
+        print(f"  Warning: Failed to save TIFF: {e}")
 
 
 def get_learning_rate(optimizer):
