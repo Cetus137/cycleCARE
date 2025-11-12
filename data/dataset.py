@@ -48,7 +48,7 @@ class UnpairedMicroscopyDataset(Dataset):
                  use_random_flip=True, use_random_rotation=False,
                  clip_min=None, clip_max=None,
                  use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0,
-                 extensions=['.tif', '.tiff', '.png', '.jpg', '.jpeg']):
+                 extensions=['.tif', '.tiff']):
         super(UnpairedMicroscopyDataset, self).__init__()
         
         self.dir_A = Path(dir_A)
