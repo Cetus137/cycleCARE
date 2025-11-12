@@ -27,38 +27,61 @@ class CycleCARE3D(nn.Module):
     - B → G_BA → A' → G_AB → B' ≈ B
     
     Args:
-        config: Configuration object with model parameters
+        img_channels (int): Number of image channels (default: 1)
+        unet_depth (int): Depth of U-Net generators (default: 3)
+        unet_filters (int): Base number of filters in generators (default: 32)
+        unet_kernel_size (int): Kernel size for generator convolutions (default: 3)
+        disc_filters (int): Base number of filters in discriminators (default: 32)
+        disc_num_layers (int): Number of layers in discriminators (default: 3)
+        disc_kernel_size (int): Kernel size for discriminator convolutions (default: 4)
+        use_batch_norm (bool): Whether to use batch normalization (default: True)
+        use_dropout (bool): Whether to use dropout in generators (default: True)
+        dropout_rate (float): Dropout probability (default: 0.5)
     """
-    def __init__(self, config):
+    def __init__(self, img_channels=1, unet_depth=3, unet_filters=32, unet_kernel_size=3,
+                 disc_filters=32, disc_num_layers=3, disc_kernel_size=4,
+                 use_batch_norm=True, use_dropout=True, dropout_rate=0.5):
         super(CycleCARE3D, self).__init__()
-        
-        self.config = config
         
         # Generators (3D U-Nets)
         self.G_AB = CAREUNet3D(
-            in_channels=config.IMG_CHANNELS,
-            out_channels=config.IMG_CHANNELS,
-            depth=config.UNET_DEPTH,
-            base_filters=config.UNET_FILTERS,
-            kernel_size=config.UNET_KERNEL_SIZE,
-            use_batch_norm=config.USE_BATCH_NORM,
-            use_dropout=config.USE_DROPOUT,
-            dropout_rate=config.DROPOUT_RATE
+            in_channels=img_channels,
+            out_channels=img_channels,
+            depth=unet_depth,
+            base_filters=unet_filters,
+            kernel_size=unet_kernel_size,
+            use_batch_norm=use_batch_norm,
+            use_dropout=use_dropout,
+            dropout_rate=dropout_rate
         )
         
         self.G_BA = CAREUNet3D(
-            in_channels=config.IMG_CHANNELS,
-            out_channels=config.IMG_CHANNELS,
-            depth=config.UNET_DEPTH,
-            base_filters=config.UNET_FILTERS,
-            kernel_size=config.UNET_KERNEL_SIZE,
-            use_batch_norm=config.USE_BATCH_NORM,
-            use_dropout=config.USE_DROPOUT,
-            dropout_rate=config.DROPOUT_RATE
+            in_channels=img_channels,
+            out_channels=img_channels,
+            depth=unet_depth,
+            base_filters=unet_filters,
+            kernel_size=unet_kernel_size,
+            use_batch_norm=use_batch_norm,
+            use_dropout=use_dropout,
+            dropout_rate=dropout_rate
         )
         
-        print(f"Generator G_AB parameters: {self.G_AB.count_parameters():,}")
-        print(f"Generator G_BA parameters: {self.G_BA.count_parameters():,}")
+        # Discriminators (3D PatchGAN)
+        self.D_A = PatchGANDiscriminator3D(
+            in_channels=img_channels,
+            base_filters=disc_filters,
+            num_layers=disc_num_layers,
+            kernel_size=disc_kernel_size,
+            use_batch_norm=use_batch_norm
+        )
+        
+        self.D_B = PatchGANDiscriminator3D(
+            in_channels=img_channels,
+            base_filters=disc_filters,
+            num_layers=disc_num_layers,
+            kernel_size=disc_kernel_size,
+            use_batch_norm=use_batch_norm
+        )
     
     def forward(self, real_A=None, real_B=None, mode='full'):
         """
@@ -138,69 +161,49 @@ class CycleCARE3D(nn.Module):
             return self.G_BA(noisy_volume)
     
     def count_parameters(self):
-        """Count total trainable parameters in both generators."""
-        return self.G_AB.count_parameters() + self.G_BA.count_parameters()
-
-
-def create_discriminators_3d(config):
-    """
-    Create discriminators for 3D Cycle-CARE.
+        """Count the number of trainable parameters for each component."""
+        return {
+            'G_AB': self.G_AB.count_parameters(),
+            'G_BA': self.G_BA.count_parameters(),
+            'D_A': self.D_A.count_parameters(),
+            'D_B': self.D_B.count_parameters(),
+            'Total': sum(p.numel() for p in self.parameters() if p.requires_grad)
+        }
     
-    Args:
-        config: Configuration object
-    
-    Returns:
-        tuple: (D_A, D_B) discriminators
-    """
-    D_A = PatchGANDiscriminator3D(
-        in_channels=config.IMG_CHANNELS,
-        base_filters=config.DISC_FILTERS,
-        num_layers=config.DISC_NUM_LAYERS,
-        kernel_size=config.DISC_KERNEL_SIZE,
-        use_batch_norm=config.USE_BATCH_NORM
-    )
-    
-    D_B = PatchGANDiscriminator3D(
-        in_channels=config.IMG_CHANNELS,
-        base_filters=config.DISC_FILTERS,
-        num_layers=config.DISC_NUM_LAYERS,
-        kernel_size=config.DISC_KERNEL_SIZE,
-        use_batch_norm=config.USE_BATCH_NORM
-    )
-    
-    print(f"Discriminator D_A parameters: {D_A.count_parameters():,}")
-    print(f"Discriminator D_B parameters: {D_B.count_parameters():,}")
-    
-    return D_A, D_B
+    def print_model_summary(self):
+        """Print a summary of the model architecture."""
+        params = self.count_parameters()
+        print("\n" + "="*60)
+        print("3D Cycle-CARE Model Summary")
+        print("="*60)
+        print(f"Generator A->B parameters: {params['G_AB']:,}")
+        print(f"Generator B->A parameters: {params['G_BA']:,}")
+        print(f"Discriminator A parameters: {params['D_A']:,}")
+        print(f"Discriminator B parameters: {params['D_B']:,}")
+        print("-"*60)
+        print(f"Total parameters: {params['Total']:,}")
+        print("="*60 + "\n")
 
 
 def test_model_3d():
     """Test the 3D Cycle-CARE model."""
     print("Testing 3D Cycle-CARE Model...")
     
-    # Create a mock config
-    class MockConfig:
-        IMG_CHANNELS = 1
-        UNET_DEPTH = 2
-        UNET_FILTERS = 16
-        UNET_KERNEL_SIZE = 3
-        USE_BATCH_NORM = True
-        USE_DROPOUT = True
-        DROPOUT_RATE = 0.5
-        DISC_FILTERS = 16
-        DISC_NUM_LAYERS = 2
-        DISC_KERNEL_SIZE = 4
-    
-    config = MockConfig()
-    
     # Create model
     print("\n1. Creating 3D Cycle-CARE model...")
-    model = CycleCARE3D(config)
-    print(f"   Total generator parameters: {model.count_parameters():,}")
-    
-    # Create discriminators
-    print("\n2. Creating 3D discriminators...")
-    D_A, D_B = create_discriminators_3d(config)
+    model = CycleCARE3D(
+        img_channels=1,
+        unet_depth=2,
+        unet_filters=16,
+        unet_kernel_size=3,
+        disc_filters=16,
+        disc_num_layers=2,
+        disc_kernel_size=4,
+        use_batch_norm=True,
+        use_dropout=True,
+        dropout_rate=0.5
+    )
+    model.print_model_summary()
     
     # Test forward pass
     print("\n3. Testing forward pass...")
@@ -223,14 +226,15 @@ def test_model_3d():
     print(f"   reconstructed_B shape: {outputs['reconstructed_B'].shape}")
     
     # Test discriminators
-    pred_A = D_A(outputs['fake_A'])
-    pred_B = D_B(outputs['fake_B'])
+    print("\n4. Testing discriminators...")
+    pred_A = model.D_A(outputs['fake_A'])
+    pred_B = model.D_B(outputs['fake_B'])
     
     print(f"   D_A prediction shape: {pred_A.shape}")
     print(f"   D_B prediction shape: {pred_B.shape}")
     
     # Test denoising mode
-    print("\n4. Testing denoise mode...")
+    print("\n5. Testing denoise mode...")
     denoised = model.denoise(real_B)
     print(f"   Denoised shape: {denoised.shape}")
     

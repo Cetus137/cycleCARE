@@ -73,9 +73,7 @@ def setup_training(config):
     # Create model
     print("\nCreating 3D Cycle-CARE model...")
     model = CycleCARE3D(
-        volume_depth=config.VOLUME_DEPTH,
-        img_height=config.IMG_HEIGHT,
-        img_width=config.IMG_WIDTH,
+        img_channels=config.IMG_CHANNELS,
         unet_depth=config.UNET_DEPTH,
         unet_filters=config.UNET_FILTERS,
         unet_kernel_size=config.UNET_KERNEL_SIZE,
