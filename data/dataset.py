@@ -38,12 +38,17 @@ class UnpairedMicroscopyDataset(Dataset):
         use_random_rotation (bool): Apply random rotation
         clip_min (float): Minimum value for clipping (None for no clipping)
         clip_max (float): Maximum value for clipping (None for no clipping)
+        use_percentile_norm (bool): Use percentile-based normalization (default True for fluorescence)
+        percentile_low (float): Lower percentile for normalization (default 1.0)
+        percentile_high (float): Upper percentile for normalization (default 99.0)
         extensions (list): List of valid image extensions
     """
-    def __init__(self, dir_A, dir_B, img_size=256, normalize_mean=0.5, normalize_std=0.5,
+    def __init__(self, dir_A, dir_B, img_size=256, 
+                 normalize_mean=0.5, normalize_std=0.5,
                  use_random_flip=True, use_random_rotation=False,
                  clip_min=None, clip_max=None,
-                 extensions=['.png', '.jpg', '.jpeg', '.tif', '.tiff']):
+                 use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0,
+                 extensions=['.tif', '.tiff', '.png', '.jpg', '.jpeg']):
         super(UnpairedMicroscopyDataset, self).__init__()
         
         self.dir_A = Path(dir_A)
@@ -51,6 +56,9 @@ class UnpairedMicroscopyDataset(Dataset):
         self.img_size = img_size
         self.clip_min = clip_min
         self.clip_max = clip_max
+        self.use_percentile_norm = use_percentile_norm
+        self.percentile_low = percentile_low
+        self.percentile_high = percentile_high
         
         # Get list of image files
         self.files_A = self._get_image_files(self.dir_A, extensions)
@@ -149,30 +157,38 @@ class UnpairedMicroscopyDataset(Dataset):
         # Convert to numpy for processing
         img_array = np.array(img)
         
-        # Determine image type and normalize appropriately
-        if img_array.dtype in [np.float32, np.float64]:
-            # Float image - already normalized to [0, 1] (common for TIF microscopy)
-            if img_array.max() <= 1.0 and img_array.min() >= 0.0:
-                # Already in [0, 1] range - perfect!
-                pass
-            else:
-                # Unexpected range - normalize to [0, 1]
-                print(f"Warning: Float image {path.name} not in [0,1] range: [{img_array.min():.3f}, {img_array.max():.3f}]")
-                img_array = (img_array - img_array.min()) / (img_array.max() - img_array.min() + 1e-8)
-        
-        elif img_array.dtype == np.uint16:
-            # 16-bit TIFF (common in microscopy) - normalize to [0, 1]
-            img_array = img_array.astype(np.float32) / 65535.0
-        
-        elif img_array.dtype == np.uint8:
-            # 8-bit image - will be normalized by ToTensor to [0, 1]
-            pass
-        
-        else:
-            # Unknown dtype - try to normalize
-            print(f"Warning: Unknown image dtype {img_array.dtype} for {path.name}, normalizing...")
+        # Convert to float for normalization
+        if img_array.dtype == np.uint16:
             img_array = img_array.astype(np.float32)
-            img_array = (img_array - img_array.min()) / (img_array.max() - img_array.min() + 1e-8)
+        elif img_array.dtype == np.uint8:
+            img_array = img_array.astype(np.float32)
+        elif img_array.dtype not in [np.float32, np.float64]:
+            img_array = img_array.astype(np.float32)
+        else:
+            img_array = img_array.astype(np.float32)
+        
+        # Normalize to [0, 1] range
+        if self.use_percentile_norm:
+            # Percentile-based normalization (robust to outliers in fluorescence)
+            p_min = np.percentile(img_array, self.percentile_low)
+            p_max = np.percentile(img_array, self.percentile_high)
+            
+            if p_max - p_min < 1e-8:
+                # Very low contrast - avoid division by zero
+                img_array = np.zeros_like(img_array)
+            else:
+                # Normalize based on percentiles and clip
+                img_array = (img_array - p_min) / (p_max - p_min)
+                img_array = np.clip(img_array, 0.0, 1.0)
+        else:
+            # Simple min-max normalization (legacy)
+            img_min = img_array.min()
+            img_max = img_array.max()
+            
+            if img_max - img_min < 1e-8:
+                img_array = np.zeros_like(img_array)
+            else:
+                img_array = (img_array - img_min) / (img_max - img_min)
         
         # Apply clipping if specified
         if self.clip_min is not None or self.clip_max is not None:
@@ -225,12 +241,16 @@ class ZStackUnpairedDataset(Dataset):
         use_random_rotation (bool): Apply random rotation
         clip_min (float): Minimum value for clipping
         clip_max (float): Maximum value for clipping
+        use_percentile_norm (bool): Use percentile-based normalization instead of min-max (default: True)
+        percentile_low (float): Lower percentile for normalization (default: 0.0)
+        percentile_high (float): Upper percentile for normalization (default: 99.0)
         extensions (list): List of valid image extensions
     """
-    def __init__(self, dir_A, dir_B, zstack_context=5, img_size=256, 
+    def __init__(self, dir_A, dir_B, zstack_context=5, img_size=256,
                  normalize_mean=0.5, normalize_std=0.5,
                  use_random_flip=True, use_random_rotation=False,
                  clip_min=None, clip_max=None,
+                 use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0,
                  extensions=['.tif', '.tiff']):
         super(ZStackUnpairedDataset, self).__init__()
         
@@ -241,6 +261,9 @@ class ZStackUnpairedDataset(Dataset):
         self.img_size = img_size
         self.clip_min = clip_min
         self.clip_max = clip_max
+        self.use_percentile_norm = use_percentile_norm
+        self.percentile_low = percentile_low
+        self.percentile_high = percentile_high
         
         # Load Z-stack metadata
         self.zstacks_A = self._discover_zstacks(self.dir_A, extensions)
@@ -381,25 +404,37 @@ class ZStackUnpairedDataset(Dataset):
         for z in range(self.zstack_context):
             plane = img_array[z]  # [H, W]
             
-            # Normalize based on dtype
-            if plane.dtype in [np.float32, np.float64]:
-                if plane.max() > 1.0 or plane.min() < 0.0:
-                    plane = (plane - plane.min()) / (plane.max() - plane.min() + 1e-8)
-            elif plane.dtype == np.uint16:
+            # Convert to float for normalization
+            if plane.dtype == np.uint16:
                 plane = plane.astype(np.float32) / 65535.0
             elif plane.dtype == np.uint8:
-                pass  # Will be normalized by ToTensor
+                plane = plane.astype(np.float32) / 255.0
+            elif plane.dtype not in [np.float32, np.float64]:
+                plane = plane.astype(np.float32)
+                if plane.max() > 1.0 or plane.min() < 0.0:
+                    plane = (plane - plane.min()) / (plane.max() - plane.min() + 1e-8)
             else:
                 plane = plane.astype(np.float32)
-                plane = (plane - plane.min()) / (plane.max() - plane.min() + 1e-8)
             
-            # Apply clipping
+            # Apply percentile-based or min-max normalization
+            if self.use_percentile_norm:
+                # Use percentile normalization for robust handling of outliers
+                p_min = np.percentile(plane, self.percentile_low)
+                p_max = np.percentile(plane, self.percentile_high)
+                if p_max - p_min > 1e-8:
+                    plane = (plane - p_min) / (p_max - p_min)
+                    plane = np.clip(plane, 0.0, 1.0)
+            else:
+                # Traditional min-max normalization
+                if plane.max() - plane.min() > 1e-8:
+                    plane = (plane - plane.min()) / (plane.max() - plane.min())
+            
+            # Apply clipping if specified
             if self.clip_min is not None or self.clip_max is not None:
-                if plane.dtype != np.uint8:
-                    if self.clip_min is not None:
-                        plane = np.maximum(plane, self.clip_min)
-                    if self.clip_max is not None:
-                        plane = np.minimum(plane, self.clip_max)
+                if self.clip_min is not None:
+                    plane = np.maximum(plane, self.clip_min)
+                if self.clip_max is not None:
+                    plane = np.minimum(plane, self.clip_max)
             
             # Convert to uint8 for PIL transforms
             if plane.dtype in [np.float32, np.float64]:
@@ -593,7 +628,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=config.USE_RANDOM_FLIP,
                 use_random_rotation=config.USE_RANDOM_ROTATION,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         else:
             full_dataset_A = UnpairedMicroscopyDataset(
@@ -605,7 +643,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=config.USE_RANDOM_FLIP,
                 use_random_rotation=config.USE_RANDOM_ROTATION,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         
         # Split indices
@@ -634,7 +675,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=False,  # No augmentation for validation
                 use_random_rotation=False,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         else:
             val_dataset_full = UnpairedMicroscopyDataset(
@@ -646,7 +690,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=False,  # No augmentation for validation
                 use_random_rotation=False,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         val_dataset = Subset(val_dataset_full, val_indices)
         
@@ -669,7 +716,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=config.USE_RANDOM_FLIP,
                 use_random_rotation=config.USE_RANDOM_ROTATION,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         else:
             train_dataset = UnpairedMicroscopyDataset(
@@ -681,7 +731,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=config.USE_RANDOM_FLIP,
                 use_random_rotation=config.USE_RANDOM_ROTATION,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         
         # Validation dataset
@@ -696,7 +749,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=False,  # No augmentation for validation
                 use_random_rotation=False,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
         else:
             val_dataset = UnpairedMicroscopyDataset(
@@ -708,7 +764,10 @@ def get_dataloaders(config, auto_split=False, val_split=0.2):
                 use_random_flip=False,  # No augmentation for validation
                 use_random_rotation=False,
                 clip_min=config.CLIP_MIN,
-                clip_max=config.CLIP_MAX
+                clip_max=config.CLIP_MAX,
+                use_percentile_norm=getattr(config, 'USE_PERCENTILE_NORM', True),
+                percentile_low=getattr(config, 'PERCENTILE_LOW', 0.0),
+                percentile_high=getattr(config, 'PERCENTILE_HIGH', 99.0)
             )
     
     # Create dataloaders with HPC optimizations

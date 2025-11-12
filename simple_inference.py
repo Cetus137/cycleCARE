@@ -14,84 +14,9 @@ from pathlib import Path
 import torchvision.transforms as transforms
 try:
     import tifffile
-    HAS_TIFFFILE = True
 except ImportError:
-    HAS_TIFFFILE = False
     tifffile = None
-    print("Warning: tifffile not available. Using PIL fallback for TIFF I/O.")
-except Exception as e:
-    HAS_TIFFFILE = False
-    tifffile = None
-    print(f"Warning: tifffile import failed ({e}). Using PIL fallback for TIFF I/O.")
 from tqdm import tqdm
-
-
-def _load_tiff_array(file_path):
-    """
-    Load a TIFF file as numpy array with fallback support.
-    Supports both single and multi-page TIFFs.
-    
-    Args:
-        file_path: Path to TIFF file
-    
-    Returns:
-        numpy.ndarray: Array with shape (H, W) or (N, H, W)
-    """
-    if HAS_TIFFFILE:
-        try:
-            return tifffile.imread(file_path)
-        except Exception as e:
-            print(f"Warning: tifffile.imread failed: {e}")
-            print("Falling back to PIL...")
-    
-    # Fallback to PIL
-    img = Image.open(file_path)
-    
-    # Check if multi-page
-    try:
-        n_frames = img.n_frames
-    except AttributeError:
-        n_frames = 1
-    
-    if n_frames == 1:
-        # Single page
-        return np.array(img)
-    else:
-        # Multi-page TIFF
-        planes = []
-        for i in range(n_frames):
-            img.seek(i)
-            planes.append(np.array(img))
-        return np.stack(planes, axis=0)  # Shape: (N, H, W)
-
-
-def _save_tiff_array(file_path, array):
-    """
-    Save numpy array as TIFF with fallback support.
-    
-    Args:
-        file_path: Path to save TIFF file
-        array: numpy array with shape (H, W) or (N, H, W)
-    """
-    if HAS_TIFFFILE:
-        try:
-            tifffile.imwrite(file_path, array)
-            return
-        except Exception as e:
-            print(f"Warning: tifffile.imwrite failed: {e}")
-            print("Falling back to PIL...")
-    
-    # Fallback to PIL
-    if len(array.shape) == 2:
-        # Single plane
-        img = Image.fromarray(array)
-        img.save(file_path)
-    elif len(array.shape) == 3:
-        # Multi-page TIFF
-        images = [Image.fromarray(array[i]) for i in range(array.shape[0])]
-        images[0].save(file_path, save_all=True, append_images=images[1:])
-    else:
-        raise ValueError(f"Cannot save array with shape {array.shape}")
 
 
 def load_model(checkpoint_path, device='cuda'):
@@ -202,19 +127,71 @@ def load_model(checkpoint_path, device='cuda'):
     return model, zstack_context
 
 
-def preprocess_image(image_array):
-    """Convert image to tensor and normalize."""
-    # Ensure float [0, 1] range
-    if image_array.dtype == np.uint8:
-        image_array = image_array.astype(np.float32) / 255.0
-    elif image_array.dtype == np.uint16:
-        image_array = image_array.astype(np.float32) / 65535.0
+def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0):
+    """
+    Convert image to tensor and normalize.
+    Uses percentile-based normalization for fluorescence microscopy.
     
-    # Convert to tensor and normalize to [-1, 1]
+    Args:
+        image_array: Input image as numpy array
+        use_percentile_norm: If True, normalize to percentile instead of min/max (recommended for fluorescence)
+        percentile_low: Lower percentile for normalization (default 0.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+    
+    Returns:
+        Normalized tensor in [-1, 1] range
+    """
+    # Convert to float32 first
+    if image_array.dtype == np.uint16:
+        # 16-bit TIFF - convert to float
+        image_array = image_array.astype(np.float32)
+    elif image_array.dtype == np.uint8:
+        # 8-bit image - convert to float
+        image_array = image_array.astype(np.float32)
+    elif image_array.dtype not in [np.float32, np.float64]:
+        # Unknown dtype - convert to float
+        image_array = image_array.astype(np.float32)
+    else:
+        image_array = image_array.astype(np.float32)
+    
+    # Normalize to [0, 1] range using percentile-based normalization
+    if use_percentile_norm:
+        # Percentile-based normalization (robust to outliers in fluorescence)
+        p_min = np.percentile(image_array, percentile_low)  # Lower percentile (default 1%)
+        p_max = np.percentile(image_array, percentile_high)  # Upper percentile (default 99%)
+        
+        # Avoid division by zero
+        if p_max - p_min < 1e-8:
+            print(f"  Warning: Very low contrast image (p{percentile_low}={p_min:.3f}, p{percentile_high}={p_max:.3f})")
+            image_array = np.zeros_like(image_array)
+        else:
+            # Normalize to [0, 1] based on percentiles
+            image_array = (image_array - p_min) / (p_max - p_min)
+            # Clip to [0, 1] (values outside percentile range get clipped)
+            image_array = np.clip(image_array, 0.0, 1.0)
+    else:
+        # Simple min-max normalization (legacy behavior)
+        img_min = image_array.min()
+        img_max = image_array.max()
+        if img_max - img_min < 1e-8:
+            image_array = np.zeros_like(image_array)
+        else:
+            image_array = (image_array - img_min) / (img_max - img_min)
+    
+    # Convert to tensor
     tensor = torch.from_numpy(image_array).float()
-    if len(tensor.shape) == 2:  # Grayscale
-        tensor = tensor.unsqueeze(0)  # Add channel dimension
-    tensor = (tensor - 0.5) / 0.5  # Normalize to [-1, 1]
+    
+    # Handle different input shapes
+    if len(tensor.shape) == 2:
+        # Grayscale (H, W) -> add channel dimension
+        tensor = tensor.unsqueeze(0)  # -> (1, H, W)
+    elif len(tensor.shape) == 3:
+        # Multi-channel, already in (C, H, W) format - keep as is
+        pass
+    
+    # Normalize to [-1, 1] using same parameters as training
+    # Formula: (x - mean) / std where mean=0.5, std=0.5
+    tensor = (tensor - 0.5) / 0.5
     
     return tensor
 
@@ -225,8 +202,16 @@ def postprocess_image(tensor):
     tensor = (tensor * 0.5) + 0.5
     tensor = torch.clamp(tensor, 0, 1)
     
-    # Convert to numpy as float32
+    # If multi-channel output (shouldn't happen, but just in case), take first channel
+    if tensor.dim() == 3 and tensor.size(0) > 1:
+        tensor = tensor[0:1]
+    
+    # Convert to numpy as float32, ensure 2D output
     image_array = tensor.squeeze().cpu().numpy().astype(np.float32)
+    
+    # Ensure 2D output
+    if image_array.ndim > 2:
+        image_array = image_array[0] if image_array.shape[0] == 1 else image_array
     
     return image_array
 
@@ -337,7 +322,8 @@ def stitch_tiles(tiles, positions, original_shape, overlap=16):
     return output.astype(np.float32)
 
 
-def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
+def restore_image(model, image_path, output_path, device='cuda', tile_size=128, zstack_context=1, 
+                  use_percentile_norm=True, percentile_low=1.0, percentile_high=99.0):
     """
     Restore a single image with automatic tiling for large images.
     
@@ -347,6 +333,10 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
         output_path: Path to save restored image (TIFF preserves float32, PNG/JPG converts to uint8)
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size (default 128 to match training)
+        zstack_context: Number of channels model expects (1 for single-plane, 5 for Z-stack)
+        use_percentile_norm: Use percentile-based normalization (recommended for fluorescence)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
     
     Returns:
         Restored image as float32 numpy array in [0, 1] range
@@ -354,26 +344,53 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
     print(f"\nProcessing: {image_path}")
     
     # Load image
-    img = Image.open(image_path)
-    img_array = np.array(img)
+    try:
+        import tifffile
+        img_array = tifffile.imread(image_path)
+    except:
+        img = Image.open(image_path)
+        img_array = np.array(img)
     
-    # Get original dimensions and ensure grayscale
+    # Handle different input shapes
     if len(img_array.shape) == 3:
-        h, w, c = img_array.shape
-        if c > 1:
-            print("Warning: Converting multi-channel to grayscale")
-            img_array = np.mean(img_array, axis=2).astype(img_array.dtype)
+        # Could be (H, W, C) or (C, H, W) - TIFF Z-stacks are usually (Z, H, W)
+        if img_array.shape[0] == zstack_context and img_array.shape[0] < img_array.shape[1]:
+            # Likely (C, H, W) format from TIFF
+            c, h, w = img_array.shape
+            print(f"  Image size: {w}×{h}, {c} channels")
+        else:
+            # Likely (H, W, C) format from PIL
+            h, w, c = img_array.shape
+            if c == zstack_context:
+                # Transpose to (C, H, W) for processing
+                img_array = np.transpose(img_array, (2, 0, 1))
+                print(f"  Image size: {w}×{h}, {c} channels (transposed to C,H,W)")
+            else:
+                # Convert to grayscale if doesn't match expected channels
+                print(f"Warning: Image has {c} channels but model expects {zstack_context}, converting to grayscale")
+                img_array = np.mean(img_array, axis=2).astype(img_array.dtype)
+                h, w = img_array.shape
+                print(f"  Image size: {w}×{h}")
     else:
         h, w = img_array.shape
-    
-    print(f"  Image size: {w}×{h}")
+        print(f"  Image size: {w}×{h}")
     
     # Check if tiling is needed
     if h <= tile_size and w <= tile_size:
         print(f"  Using direct processing (image ≤ {tile_size}×{tile_size})")
         
-        # Preprocess
-        tensor = preprocess_image(img_array)
+        # Preprocess with percentile normalization
+        tensor = preprocess_image(img_array, use_percentile_norm=use_percentile_norm, 
+                                 percentile_low=percentile_low, percentile_high=percentile_high)
+        
+        # Handle Z-stack context: replicate single channel if needed
+        if tensor.shape[0] == 1 and zstack_context > 1:
+            # Single channel but model expects multi-channel - replicate
+            tensor = tensor.repeat(zstack_context, 1, 1)
+            print(f"  Replicated single channel to {zstack_context} channels for Z-stack model")
+        elif tensor.shape[0] != zstack_context:
+            print(f"  Warning: Tensor has {tensor.shape[0]} channels but model expects {zstack_context}")
+        
         tensor = tensor.unsqueeze(0).to(device)  # Add batch dimension
         
         # Restore
@@ -393,8 +410,9 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
         # Process each tile
         restored_tiles = []
         for i, tile in enumerate(tiles):
-            # Preprocess
-            tensor = preprocess_image(tile)
+            # Preprocess with percentile normalization
+            tensor = preprocess_image(tile, use_percentile_norm=use_percentile_norm, 
+                                     percentile_low=percentile_low, percentile_high=percentile_high)
             tensor = tensor.unsqueeze(0).to(device)
             
             # Restore
@@ -418,7 +436,12 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128):
     
     # Save as float32 TIFF (preserves full precision) or convert to uint8/uint16 for other formats
     if output_path.suffix.lower() in ['.tif', '.tiff']:
-        _save_tiff_array(output_path, restored)
+        if tifffile is not None:
+            tifffile.imwrite(output_path, restored)
+        else:
+            # Fallback: convert to uint16 for PIL
+            restored_uint16 = (restored * 65535).astype(np.uint16)
+            Image.fromarray(restored_uint16).save(output_path)
     else:
         # For PNG, JPG etc: convert to uint8
         restored_uint8 = (restored * 255).astype(np.uint8)
@@ -486,20 +509,32 @@ def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, ov
     for tile, (y, x, y_end, x_end) in zip(restored_tiles, positions):
         tile_h = y_end - y
         tile_w = x_end - x
+        
+        # Ensure tile is 2D
+        if tile.ndim > 2:
+            tile = tile.squeeze()
+        
+        # Crop tile to actual size
         tile_crop = tile[:tile_h, :tile_w]
         
         # Create weight map with soft edges
         tile_weights = np.ones((tile_h, tile_w), dtype=np.float32)
         
         if overlap > 0:
-            if y > 0:
-                tile_weights[:overlap, :] *= np.linspace(0, 1, overlap)[:, np.newaxis]
-            if y_end < h:
-                tile_weights[-overlap:, :] *= np.linspace(1, 0, overlap)[:, np.newaxis]
-            if x > 0:
-                tile_weights[:, :overlap] *= np.linspace(0, 1, overlap)
-            if x_end < w:
-                tile_weights[:, -overlap:] *= np.linspace(1, 0, overlap)
+            # Calculate actual overlap for edges
+            overlap_top = min(overlap, tile_h) if y > 0 else 0
+            overlap_bottom = min(overlap, tile_h) if y_end < h else 0
+            overlap_left = min(overlap, tile_w) if x > 0 else 0
+            overlap_right = min(overlap, tile_w) if x_end < w else 0
+            
+            if overlap_top > 0:
+                tile_weights[:overlap_top, :] *= np.linspace(0, 1, overlap_top)[:, np.newaxis]
+            if overlap_bottom > 0:
+                tile_weights[-overlap_bottom:, :] *= np.linspace(1, 0, overlap_bottom)[:, np.newaxis]
+            if overlap_left > 0:
+                tile_weights[:, :overlap_left] *= np.linspace(0, 1, overlap_left)
+            if overlap_right > 0:
+                tile_weights[:, -overlap_right:] *= np.linspace(1, 0, overlap_right)
         
         output[y:y_end, x:x_end] += tile_crop * tile_weights
         weights[y:y_end, x:x_end] += tile_weights
@@ -533,9 +568,25 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     if zstack_context > 1:
         print(f"  Using {zstack_context}-plane context window")
     
-    # Load as multi-page TIFF (uses fallback if tifffile unavailable)
+    # Try to load as multi-page TIFF
     try:
-        zstack = _load_tiff_array(zstack_path)
+        # Try tifffile first (better for scientific images)
+        try:
+            import tifffile
+            zstack = tifffile.imread(zstack_path)
+        except ImportError:
+            # Fallback to PIL
+            img = Image.open(zstack_path)
+            planes = []
+            try:
+                i = 0
+                while True:
+                    img.seek(i)
+                    planes.append(np.array(img))
+                    i += 1
+            except EOFError:
+                pass
+            zstack = np.array(planes)
     except Exception as e:
         print(f"Error loading Z-stack: {e}")
         print("Treating as single plane image")
@@ -633,23 +684,35 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     if num_planes == 1:
-        # Single plane
+        # Single plane - save with same logic as restore_image
         if output_path.suffix.lower() in ['.tif', '.tiff']:
-            _save_tiff_array(output_path, restored_zstack[0])
+            if tifffile is not None:
+                tifffile.imwrite(output_path, restored_zstack[0])
+            else:
+                # Fallback: convert to uint16 for PIL
+                restored_uint16 = (restored_zstack[0] * 65535).astype(np.uint16)
+                Image.fromarray(restored_uint16).save(output_path)
         else:
             # For PNG, JPG etc: convert to uint8
             restored_uint8 = (restored_zstack[0] * 255).astype(np.uint8)
             Image.fromarray(restored_uint8).save(output_path)
     else:
-        # Z-stack - save as multi-page TIFF
-        _save_tiff_array(output_path, restored_zstack)
+        # Z-stack - save as multi-page TIFF (always float32 with tifffile, or uint16 fallback)
+        if tifffile is not None:
+            tifffile.imwrite(output_path, restored_zstack)
+        else:
+            # Fallback: convert to uint16 for PIL multi-page TIFF
+            restored_uint16 = (restored_zstack * 65535).astype(np.uint16)
+            images = [Image.fromarray(plane) for plane in restored_uint16]
+            images[0].save(output_path, save_all=True, append_images=images[1:])
     
     print(f"  ✓ Saved to: {output_path}")
     
     return restored_zstack
 
 
-def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda', tile_size=128):
+def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda', tile_size=128,
+                         use_percentile_norm=True, percentile_low=1.0, percentile_high=99.0):
     """
     Denoise a single 2D image.
     
@@ -659,6 +722,9 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
         output_path: Path to save restored image (use .tif/.tiff to preserve float32 precision)
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size for large images (default 128)
+        use_percentile_norm: Use percentile-based normalization (recommended for fluorescence, default True)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
     
     Returns:
         Restored image as float32 numpy array in [0, 1] range
@@ -681,7 +747,9 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
         print(f"   For single 2D images, output may be suboptimal.")
         print(f"   Consider using denoise_zstack() for best results.")
     
-    restored = restore_image(model, input_path, output_path, device=device, tile_size=tile_size)
+    restored = restore_image(model, input_path, output_path, device=device, tile_size=tile_size, 
+                            zstack_context=zstack_context, use_percentile_norm=use_percentile_norm, 
+                            percentile_low=percentile_low, percentile_high=percentile_high)
     
     print("✓ Done!")
     return restored
@@ -777,7 +845,7 @@ if __name__ == "__main__":
     # Example usage - uncomment the one you want to run:
     
     denoise_zstack(
-        checkpoint_path='/Users/ewheeler/cycleCARE_HPC/outputs/checkpoints/checkpoint_epoch_0090.pth',
-        input_path ='/Users/ewheeler/cycleCARE_HPC/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation0.tif',
-        output_path='/Users/ewheeler/cycleCARE_HPC/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation0_restored.tif',
+        checkpoint_path= '/Users/ewheeler/Downloads/checkpoint_epoch_0080.pth',
+        input_path     = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49.tif',
+        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49_restored.tif',
     )

@@ -20,7 +20,7 @@ class Config:
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
     TRAIN_A_DIR = DATA_ROOT / "z100_z105_tiles/T0_C0"   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT / "z220_z225_tiles/T0_C0"   # Noisy microscopy images to restore
+    TRAIN_B_DIR = DATA_ROOT / "z220_z225_tiles/"   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
@@ -76,6 +76,12 @@ class Config:
     
     # ==================== Data Processing ====================
     IMG_SIZE = 128            # Input image size (128x128 TIF images)
+    
+    # Percentile-based normalization for fluorescence microscopy
+    # Robust to outliers like hot pixels, saturated spots, and variable background
+    USE_PERCENTILE_NORM = True  # Use percentile-based normalization instead of min-max
+    PERCENTILE_LOW = 0.0        # Lower percentile for normalization (removes dark background)
+    PERCENTILE_HIGH = 99.0      # Upper percentile for normalization (removes hot pixels)
     
     # Images are pre-normalized to [0, 1] range
     # To convert to [-1, 1] for model: x_normalized = (x - 0.5) / 0.5
