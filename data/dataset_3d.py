@@ -315,6 +315,182 @@ class Volume3DUnpairedDataset(Dataset):
         return volume
 
 
+def split_dataset_indices(dataset, val_split=0.2, random_seed=42):
+    """
+    Split dataset indices into training and validation sets.
+    
+    Args:
+        dataset: PyTorch dataset
+        val_split (float): Fraction for validation
+        random_seed (int): Random seed for reproducibility
+    
+    Returns:
+        tuple: (train_indices, val_indices)
+    """
+    np.random.seed(random_seed)
+    indices = np.arange(len(dataset))
+    np.random.shuffle(indices)
+    
+    split_idx = int(len(indices) * (1 - val_split))
+    train_indices = indices[:split_idx].tolist()
+    val_indices = indices[split_idx:].tolist()
+    
+    return train_indices, val_indices
+
+
+def get_dataloaders_3d(config, auto_split=False, val_split=0.2):
+    """
+    Create 3D training and validation dataloaders.
+    
+    Supports two modes:
+    1. Pre-split: Separate directories for train and validation (default)
+    2. Auto-split: Single directory that gets split automatically
+    
+    Args:
+        config: Configuration object with 3D settings
+        auto_split (bool): If True, automatically split data from single directories
+        val_split (float): Fraction of data for validation when auto_split=True
+    
+    Returns:
+        tuple: (train_loader, val_loader)
+    """
+    from torch.utils.data import DataLoader, Subset
+    
+    print(f"\n{'='*60}")
+    print("Creating 3D Volume Dataloaders")
+    print(f"{'='*60}\n")
+    
+    if auto_split:
+        # ===== AUTO-SPLIT MODE =====
+        # Load all data from a single directory and split automatically
+        print(f"\n{'='*60}")
+        print("AUTO-SPLIT MODE: Splitting data automatically")
+        print(f"Validation split: {val_split*100:.1f}%")
+        print(f"{'='*60}\n")
+        
+        # Create full dataset with augmentation
+        full_dataset = Volume3DUnpairedDataset(
+            dir_A=config.TRAIN_A_DIR,
+            dir_B=config.TRAIN_B_DIR,
+            volume_depth=config.VOLUME_DEPTH,
+            img_height=config.IMG_HEIGHT,
+            img_width=config.IMG_WIDTH,
+            normalize_mean=config.NORMALIZE_MEAN,
+            normalize_std=config.NORMALIZE_STD,
+            use_random_crop=config.USE_RANDOM_CROP,
+            use_random_flip=config.USE_RANDOM_FLIP,
+            use_random_rotation=config.USE_RANDOM_ROTATION,
+            clip_min=config.CLIP_MIN,
+            clip_max=config.CLIP_MAX,
+            use_percentile_norm=config.USE_PERCENTILE_NORM,
+            percentile_low=config.PERCENTILE_LOW,
+            percentile_high=config.PERCENTILE_HIGH
+        )
+        
+        # Split indices
+        train_indices, val_indices = split_dataset_indices(
+            full_dataset,
+            val_split=val_split,
+            random_seed=config.RANDOM_SEED
+        )
+        
+        print(f"Total volumes: {len(full_dataset)}")
+        print(f"Training volumes: {len(train_indices)}")
+        print(f"Validation volumes: {len(val_indices)}\n")
+        
+        # Create training subset
+        train_dataset = Subset(full_dataset, train_indices)
+        
+        # Create validation dataset (no augmentation)
+        val_dataset_full = Volume3DUnpairedDataset(
+            dir_A=config.TRAIN_A_DIR,  # Same directory
+            dir_B=config.TRAIN_B_DIR,  # Same directory
+            volume_depth=config.VOLUME_DEPTH,
+            img_height=config.IMG_HEIGHT,
+            img_width=config.IMG_WIDTH,
+            normalize_mean=config.NORMALIZE_MEAN,
+            normalize_std=config.NORMALIZE_STD,
+            use_random_crop=False,  # No augmentation for validation
+            use_random_flip=False,
+            use_random_rotation=False,
+            clip_min=config.CLIP_MIN,
+            clip_max=config.CLIP_MAX,
+            use_percentile_norm=config.USE_PERCENTILE_NORM,
+            percentile_low=config.PERCENTILE_LOW,
+            percentile_high=config.PERCENTILE_HIGH
+        )
+        val_dataset = Subset(val_dataset_full, val_indices)
+        
+    else:
+        # ===== PRE-SPLIT MODE =====
+        # Use separate directories for train and validation
+        print(f"\n{'='*60}")
+        print("PRE-SPLIT MODE: Using separate train/val directories")
+        print(f"{'='*60}\n")
+        
+        # Training dataset
+        train_dataset = Volume3DUnpairedDataset(
+            dir_A=config.TRAIN_A_DIR,
+            dir_B=config.TRAIN_B_DIR,
+            volume_depth=config.VOLUME_DEPTH,
+            img_height=config.IMG_HEIGHT,
+            img_width=config.IMG_WIDTH,
+            normalize_mean=config.NORMALIZE_MEAN,
+            normalize_std=config.NORMALIZE_STD,
+            use_random_crop=config.USE_RANDOM_CROP,
+            use_random_flip=config.USE_RANDOM_FLIP,
+            use_random_rotation=config.USE_RANDOM_ROTATION,
+            clip_min=config.CLIP_MIN,
+            clip_max=config.CLIP_MAX,
+            use_percentile_norm=config.USE_PERCENTILE_NORM,
+            percentile_low=config.PERCENTILE_LOW,
+            percentile_high=config.PERCENTILE_HIGH
+        )
+        
+        # Validation dataset (no augmentation)
+        val_dataset = Volume3DUnpairedDataset(
+            dir_A=config.VAL_A_DIR,
+            dir_B=config.VAL_B_DIR,
+            volume_depth=config.VOLUME_DEPTH,
+            img_height=config.IMG_HEIGHT,
+            img_width=config.IMG_WIDTH,
+            normalize_mean=config.NORMALIZE_MEAN,
+            normalize_std=config.NORMALIZE_STD,
+            use_random_crop=False,  # No random crop for validation
+            use_random_flip=False,
+            use_random_rotation=False,
+            clip_min=config.CLIP_MIN,
+            clip_max=config.CLIP_MAX,
+            use_percentile_norm=config.USE_PERCENTILE_NORM,
+            percentile_low=config.PERCENTILE_LOW,
+            percentile_high=config.PERCENTILE_HIGH
+        )
+    
+    # Create dataloaders with HPC optimizations
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY if hasattr(config, 'PIN_MEMORY') else (True if config.DEVICE == 'cuda' else False),
+        drop_last=True,  # Drop last incomplete batch
+        prefetch_factor=config.PREFETCH_FACTOR if hasattr(config, 'PREFETCH_FACTOR') else 2,
+        persistent_workers=config.PERSISTENT_WORKERS if hasattr(config, 'PERSISTENT_WORKERS') and config.NUM_WORKERS > 0 else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY if hasattr(config, 'PIN_MEMORY') else (True if config.DEVICE == 'cuda' else False),
+        prefetch_factor=config.PREFETCH_FACTOR if hasattr(config, 'PREFETCH_FACTOR') else 2,
+        persistent_workers=config.PERSISTENT_WORKERS if hasattr(config, 'PERSISTENT_WORKERS') and config.NUM_WORKERS > 0 else False
+    )
+    
+    return train_loader, val_loader
+
+
 def test_dataset_3d():
     """Test the 3D dataset."""
     print("Testing Volume3DUnpairedDataset...")
