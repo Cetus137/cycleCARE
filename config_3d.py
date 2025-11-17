@@ -1,5 +1,5 @@
 """
-Configuration file for 3D Cycle-CARE model - HPC Optimized.
+Configuration file for 3D Cycle-CARE model - HPC Optimized.;
 Extends the base config for full 3D volumetric processing.
 """
 
@@ -37,11 +37,11 @@ class Config3D:
     # ==================== 3D Model Architecture ====================
     # Generator (CARE-style 3D U-Net)
     IMG_CHANNELS = 1          # Input channels (1 for grayscale microscopy)
-    VOLUME_DEPTH = 32         # Number of Z-planes in training volumes
+    VOLUME_DEPTH = 5          # Number of Z-planes in training volumes (MUST match your data!)
     IMG_HEIGHT = 128          # Height of training volumes
     IMG_WIDTH = 128           # Width of training volumes
     
-    UNET_DEPTH = 3            # Depth of 3D U-Net (3 for 32×128×128)
+    UNET_DEPTH = 2            # Depth of 3D U-Net (reduced for shallow volumes)
     UNET_FILTERS = 32         # Base filters (reduced from 64 due to memory)
     UNET_KERNEL_SIZE = 3      # Kernel size for 3D convolutions
     USE_DROPOUT = True        # Use dropout in 3D U-Net
@@ -50,8 +50,8 @@ class Config3D:
     
     # Discriminator (3D PatchGAN)
     DISC_FILTERS = 32         # Base filters (reduced from 64 due to memory)
-    DISC_NUM_LAYERS = 3       # Number of layers in 3D discriminator
-    DISC_KERNEL_SIZE = 4      # Kernel size for 3D discriminator
+    DISC_NUM_LAYERS = 2       # Number of layers in 3D discriminator (reduced for shallow volumes)
+    DISC_KERNEL_SIZE = 3      # Kernel size for 3D discriminator (reduced from 4 for shallow volumes)
     
     # ==================== Training Parameters (3D Optimized) ====================
     # CRITICAL: 3D models require MUCH smaller batch sizes
@@ -65,6 +65,18 @@ class Config3D:
     LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss
     LAMBDA_IDENTITY = 5.0     # Weight for identity loss
     LAMBDA_ADV = 1.0          # Weight for adversarial loss
+    
+    # Loss types - choose from: 'l1', 'l2', 'ssim', 'combined'
+    # - 'l1': Mean Absolute Error (pixel-wise, sharp but can be blocky)
+    # - 'l2': Mean Squared Error (pixel-wise, sensitive to outliers, can blur)
+    # - 'ssim': Structural Similarity (perceptual, preserves texture/structure)
+    # - 'combined': SSIM + L1 (best of both: structure + pixel accuracy)
+    CYCLE_LOSS_TYPE = 'combined'     # Recommended: 'combined' or 'ssim' for denoising
+    IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
+    
+    # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
+    SSIM_WEIGHT = 0.84        # Weight for SSIM component (typically 0.84)
+    L1_WEIGHT = 0.16          # Weight for L1 component (typically 0.16)
     
     # Learning rate scheduling
     LR_DECAY_START_EPOCH = 100

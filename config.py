@@ -69,6 +69,13 @@ class Config:
     LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss
     LAMBDA_IDENTITY = 5.0     # Weight for identity loss (helps preserve color)
     LAMBDA_ADV = 1.0          # Weight for adversarial loss
+
+    CYCLE_LOSS_TYPE = 'combined'     # Recommended: 'combined' or 'ssim' for denoising
+    IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
+    
+    # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
+    SSIM_WEIGHT = 0.84        # Weight for SSIM component (typically 0.84)
+    L1_WEIGHT = 0.16      
     
     # Learning rate scheduling
     LR_DECAY_START_EPOCH = 100  # Epoch to start decaying learning rate

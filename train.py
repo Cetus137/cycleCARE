@@ -4,9 +4,6 @@ Includes mixed precision training, gradient accumulation, and multi-GPU support.
 """
 
 import os
-# Fix for macOS OpenMP library conflict
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
 import time
 import torch
 import torch.nn as nn
