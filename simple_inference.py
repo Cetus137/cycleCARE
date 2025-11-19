@@ -37,6 +37,7 @@ def load_model(checkpoint_path, device='cuda'):
         checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Get config from checkpoint
+    cfg = None
     if 'config' in checkpoint:
         cfg = checkpoint['config']
         
@@ -105,26 +106,83 @@ def load_model(checkpoint_path, device='cuda'):
         
         print(f"Inferred architecture: UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
     
-    # Create model
-    model = CycleCARE(
-        img_channels=img_channels,
-        unet_depth=unet_depth,
-        unet_filters=unet_filters,
-        unet_kernel_size=3,
-        disc_filters=64,
-        disc_num_layers=3,
-        disc_kernel_size=4,
-        use_batch_norm=True,
-        use_dropout=True,
-        dropout_rate=0.5
-    ).to(device)
-    
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    print(f"✓ Model loaded successfully from {checkpoint_path}")
-    return model, zstack_context
+    # Decide whether the checkpoint is 3D (Conv3d weights present)
+    try:
+        from models.cycle_care_3d import CycleCARE3D
+    except Exception:
+        CycleCARE3D = None
+
+    state = checkpoint.get('model_state_dict', checkpoint)
+    is_3d_ckpt = False
+    # Detect any 5D conv weight tensors in the state dict
+    for v in state.values():
+        if isinstance(v, torch.Tensor) and v.dim() == 5:
+            is_3d_ckpt = True
+            break
+
+    if is_3d_ckpt and CycleCARE3D is not None:
+        # Read architecture from config for 3D model
+        disc_f = cfg.get('DISC_FILTERS', 32) if isinstance(cfg, dict) else getattr(cfg, 'DISC_FILTERS', 32)
+        disc_layers = cfg.get('DISC_NUM_LAYERS', 2) if isinstance(cfg, dict) else getattr(cfg, 'DISC_NUM_LAYERS', 2)
+        disc_kernel = cfg.get('DISC_KERNEL_SIZE', 3) if isinstance(cfg, dict) else getattr(cfg, 'DISC_KERNEL_SIZE', 3)
+        unet_kernel = cfg.get('UNET_KERNEL_SIZE', 3) if isinstance(cfg, dict) else getattr(cfg, 'UNET_KERNEL_SIZE', 3)
+        use_bn = cfg.get('USE_BATCH_NORM', True) if isinstance(cfg, dict) else getattr(cfg, 'USE_BATCH_NORM', True)
+        use_drop = cfg.get('USE_DROPOUT', True) if isinstance(cfg, dict) else getattr(cfg, 'USE_DROPOUT', True)
+        drop_rate = cfg.get('DROPOUT_RATE', 0.5) if isinstance(cfg, dict) else getattr(cfg, 'DROPOUT_RATE', 0.5)
+        
+        # Determine expected volume depth (z-context) from config if present
+        if isinstance(cfg, dict):
+            zstack_context = cfg.get('VOLUME_DEPTH', cfg.get('ZSTACK_CONTEXT', img_channels))
+        else:
+            zstack_context = getattr(cfg, 'VOLUME_DEPTH', getattr(cfg, 'ZSTACK_CONTEXT', img_channels))
+
+        model = CycleCARE3D(
+            img_channels=img_channels,
+            unet_depth=unet_depth,
+            unet_filters=unet_filters,
+            unet_kernel_size=unet_kernel,
+            disc_filters=disc_f,
+            disc_num_layers=disc_layers,
+            disc_kernel_size=disc_kernel,
+            use_batch_norm=use_bn,
+            use_dropout=use_drop,
+            dropout_rate=drop_rate
+        ).to(device)
+
+        # Load weights with non-strict loading to tolerate key differences
+        try:
+            model.load_state_dict(state, strict=False)
+        except Exception as e:
+            print(f"  Warning: Could not load some weights: {e}")
+
+        model.eval()
+        print(f"✓ 3D model loaded from {checkpoint_path}")
+        print(f"  Architecture: depth={unet_depth}, filters={unet_filters}, volume_depth={zstack_context}")
+        return model, zstack_context
+    else:
+        # Build legacy 2D model and load state dict loosely to avoid missing/unexpected key errors
+        model = CycleCARE(
+            img_channels=img_channels,
+            unet_depth=unet_depth,
+            unet_filters=unet_filters,
+            unet_kernel_size=3,
+            disc_filters=64,
+            disc_num_layers=3,
+            disc_kernel_size=4,
+            use_batch_norm=True,
+            use_dropout=True,
+            dropout_rate=0.5
+        ).to(device)
+
+        try:
+            model.load_state_dict(state, strict=False)
+        except Exception:
+            # Last resort: try strict load (will raise helpful error)
+            model.load_state_dict(state)
+
+        model.eval()
+        print(f"✓ 2D model loaded successfully from {checkpoint_path}")
+        return model, zstack_context
 
 
 def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0):
@@ -194,6 +252,55 @@ def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, 
     tensor = (tensor - 0.5) / 0.5
     
     return tensor
+
+
+def compute_normalization_params(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0):
+    """Compute and return normalization parameters for an image/plane.
+
+    Returns a dict with keys: p_min, p_max, orig_dtype
+    """
+    orig_dtype = image_array.dtype
+    arr = image_array.astype(np.float32)
+    if use_percentile_norm:
+        p_min = float(np.percentile(arr, percentile_low))
+        p_max = float(np.percentile(arr, percentile_high))
+    else:
+        p_min = float(arr.min())
+        p_max = float(arr.max())
+
+    return {'p_min': p_min, 'p_max': p_max, 'orig_dtype': orig_dtype}
+
+
+def normalize_to_model_tensor(image_array, params):
+    """Normalize numpy image using params and return a torch tensor in [-1,1].
+
+    Input image_array should be a 2D array (H,W).
+    """
+    p_min = params['p_min']
+    p_max = params['p_max']
+    if p_max - p_min < 1e-8:
+        norm = np.zeros_like(image_array, dtype=np.float32)
+    else:
+        norm = (image_array.astype(np.float32) - p_min) / (p_max - p_min)
+        norm = np.clip(norm, 0.0, 1.0)
+
+    tensor = torch.from_numpy(norm).float()
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(0)
+    # map to [-1, 1]
+    tensor = (tensor - 0.5) / 0.5
+    return tensor
+
+
+def denormalize_from_model_array(arr_0_1, params):
+    """Convert an array in [0,1] back to the original input value range.
+
+    Returns a float32 numpy array in the original measurement units.
+    """
+    p_min = params['p_min']
+    p_max = params['p_max']
+    denorm = arr_0_1.astype(np.float32) * (p_max - p_min) + p_min
+    return denorm
 
 
 def postprocess_image(tensor):
@@ -497,7 +604,20 @@ def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, ov
         tile_batch = tile.unsqueeze(0).to(device)  # [1, N_channels, H, W]
         
         with torch.no_grad():
-            restored_tensor = model.restore(tile_batch)
+            # Check if model is 3D (has denoise method)
+            if hasattr(model, 'denoise'):
+                # 3D model: reshape [1, N, H, W] -> [1, 1, N, H, W] and call denoise
+                input_3d = tile_batch.unsqueeze(1)  # [1, 1, N, H, W]
+                output_3d = model.denoise(input_3d)  # [1, 1, D, H, W]
+                # Extract center plane
+                D = output_3d.size(2)
+                center_idx = tile_batch.size(1) // 2 if tile_batch.size(1) <= D else D // 2
+                restored_tensor = output_3d[:, :, center_idx, :, :].unsqueeze(1)  # [1, 1, 1, H, W] -> [1, 1, H, W]
+                if restored_tensor.dim() == 5:
+                    restored_tensor = restored_tensor.squeeze(2)  # [1, 1, H, W]
+            else:
+                # 2D model: use restore method
+                restored_tensor = model.restore(tile_batch)
         
         restored_tile = postprocess_image(restored_tensor[0])
         restored_tiles.append(restored_tile)
@@ -587,6 +707,7 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
             except EOFError:
                 pass
             zstack = np.array(planes)
+            
     except Exception as e:
         print(f"Error loading Z-stack: {e}")
         print("Treating as single plane image")
@@ -664,7 +785,20 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
             input_batch = stacked_input.unsqueeze(0).to(device)  # Add batch dim: [1, N, H, W]
             
             with torch.no_grad():
-                restored_tensor = model.restore(input_batch)
+                # Check if model is 3D (has denoise method)
+                if hasattr(model, 'denoise'):
+                    # 3D model: reshape [1, N, H, W] -> [1, 1, N, H, W] and call denoise
+                    input_3d = input_batch.unsqueeze(1)  # [1, 1, N, H, W]
+                    output_3d = model.denoise(input_3d)  # [1, 1, D, H, W]
+                    # Extract center plane
+                    D = output_3d.size(2)
+                    center_idx = stacked_input.size(0) // 2 if stacked_input.size(0) <= D else D // 2
+                    restored_tensor = output_3d[:, :, center_idx, :, :].unsqueeze(1)  # [1, 1, 1, H, W] -> [1, 1, H, W]
+                    if restored_tensor.dim() == 5:
+                        restored_tensor = restored_tensor.squeeze(2)  # [1, 1, H, W]
+                else:
+                    # 2D model: use restore method
+                    restored_tensor = model.restore(input_batch)
             
             restored_plane = postprocess_image(restored_tensor[0])
         else:
@@ -843,9 +977,8 @@ def denoise_batch(checkpoint_path, input_dir, output_dir, device='cuda', tile_si
 
 if __name__ == "__main__":
     # Example usage - uncomment the one you want to run:
-    
     denoise_zstack(
-        checkpoint_path= '/Users/ewheeler/Downloads/checkpoint_epoch_0080.pth',
+        checkpoint_path= '/Users/ewheeler/cycleCARE_HPC/outputs/checkpoints/checkpoint_epoch_0080.pth',
         input_path     = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49.tif',
-        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49_restored.tif',
+        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49_restored_3D.tif',
     )

@@ -71,31 +71,45 @@ class GANLoss(nn.Module):
 
 class CycleConsistencyLoss(nn.Module):
     """
-    Cycle-consistency loss.
+    Cycle-consistency loss with automatic 2D/3D detection.
     
     Ensures that F(G(x)) ≈ x and G(F(y)) ≈ y
     where F and G are the two generators.
     
     This loss is crucial for learning meaningful mappings without paired data.
     
+    Automatically detects input dimensions:
+    - 4D tensors [B,C,H,W]: Uses 2D SSIM (treats C as channels/Z-planes independently)
+    - 5D tensors [B,C,D,H,W]: Uses 3D SSIM (computes volumetric structural similarity)
+    
     Args:
         loss_type (str): Type of loss ('l1', 'l2', 'ssim', or 'combined')
         ssim_weight (float): Weight for SSIM in combined loss (default: 0.84)
         l1_weight (float): Weight for L1 in combined loss (default: 0.16)
+        is_3d (bool): Force 3D mode (auto-detected if None)
     """
-    def __init__(self, loss_type='l1', ssim_weight=0.84, l1_weight=0.16):
+    def __init__(self, loss_type='l1', ssim_weight=0.84, l1_weight=0.16, is_3d=None, grad_weight: float = 0.0,
+                 ssim_window_2d: int = 11, ssim_window_3d: int = 11):
         super(CycleConsistencyLoss, self).__init__()
         
         self.loss_type = loss_type
+        self.is_3d = is_3d  # None = auto-detect
+        self.grad_weight = grad_weight
         
         if loss_type == 'l1':
             self.loss = nn.L1Loss()
         elif loss_type == 'l2':
             self.loss = nn.MSELoss()
         elif loss_type == 'ssim':
-            self.loss = SSIMLoss(window_size=11, channel=1)
+            # Will be set dynamically based on input dimensionality
+            self.ssim_2d = SSIMLoss(window_size=ssim_window_2d, channel=1)
+            self.ssim_3d = SSIM3DLoss(window_size=ssim_window_3d, channel=1)
+            self.loss = None  # Set dynamically
         elif loss_type == 'combined':
-            self.loss = CombinedLoss(ssim_weight=ssim_weight, l1_weight=l1_weight, channel=1)
+            # Will be set dynamically based on input dimensionality
+            self.combined_2d = CombinedLoss(ssim_weight=ssim_weight, l1_weight=l1_weight, channel=1, grad_weight=grad_weight, window_size=ssim_window_2d)
+            self.combined_3d = Combined3DLoss(ssim_weight=ssim_weight, l1_weight=l1_weight, channel=1, grad_weight=grad_weight, window_size=ssim_window_3d)
+            self.loss = None  # Set dynamically
         else:
             raise NotImplementedError(f'Loss type {loss_type} not implemented')
     
@@ -103,14 +117,33 @@ class CycleConsistencyLoss(nn.Module):
         """
         Calculate cycle-consistency loss.
         
+        Automatically uses 2D or 3D SSIM based on input dimensionality:
+        - 4D input [B,C,H,W]: 2D SSIM (Z-context models)
+        - 5D input [B,C,D,H,W]: 3D SSIM (volumetric models)
+        
         Args:
-            reconstructed (torch.Tensor): Reconstructed image after cycle
-            original (torch.Tensor): Original image
+            reconstructed (torch.Tensor): Reconstructed image/volume after cycle
+            original (torch.Tensor): Original image/volume
         
         Returns:
             torch.Tensor: Loss value
         """
-        return self.loss(reconstructed, original)
+        # Auto-detect 2D vs 3D if not explicitly set
+        if self.is_3d is None:
+            input_is_3d = (reconstructed.dim() == 5)
+        else:
+            input_is_3d = self.is_3d
+        
+        # For SSIM and combined losses, select appropriate version
+        if self.loss_type == 'ssim':
+            loss_fn = self.ssim_3d if input_is_3d else self.ssim_2d
+            return loss_fn(reconstructed, original)
+        elif self.loss_type == 'combined':
+            loss_fn = self.combined_3d if input_is_3d else self.combined_2d
+            return loss_fn(reconstructed, original)
+        else:
+            # L1/L2 work for both 2D and 3D
+            return self.loss(reconstructed, original)
 
 
 class IdentityLoss(nn.Module):
@@ -255,6 +288,72 @@ class SSIMLoss(nn.Module):
         return 1 - ssim_value
 
 
+class GradientLoss(nn.Module):
+    """
+    Gradient-based loss to preserve edges and fine morphology.
+
+    Computes L1 loss between image gradients of prediction and target.
+    Supports 2D (images: B,C,H,W) and 3D volumes (B,C,D,H,W).
+
+    Args:
+        is_3d (bool): If True, compute 3D gradients; else 2D.
+    """
+    def __init__(self, is_3d: bool = False, eps: float = 1e-6):
+        super(GradientLoss, self).__init__()
+        self.is_3d = is_3d
+        self.eps = eps
+
+    def _grad_2d(self, img: torch.Tensor):
+        # Sobel kernels
+        device = img.device
+        kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device)
+        ky = kx.t()
+        kx = kx.view(1, 1, 3, 3)
+        ky = ky.view(1, 1, 3, 3)
+        c = img.shape[1]
+        kx = kx.repeat(c, 1, 1, 1)
+        ky = ky.repeat(c, 1, 1, 1)
+
+        gx = F.conv2d(img, kx, padding=1, groups=c)
+        gy = F.conv2d(img, ky, padding=1, groups=c)
+        return gx, gy
+
+    def _grad_3d(self, vol: torch.Tensor):
+        # Simple finite-difference kernels along each axis (size 3)
+        device = vol.device
+        # kernel along width (x)
+        kx = torch.tensor([[-1., 0., 1.]], device=device).view(1, 1, 1, 1, 3)
+        # kernel along height (y)
+        ky = torch.tensor([[-1., 0., 1.]], device=device).view(1, 1, 1, 3, 1)
+        # kernel along depth (z)
+        kz = torch.tensor([[-1., 0., 1.]], device=device).view(1, 1, 3, 1, 1)
+
+        c = vol.shape[1]
+        kx = kx.repeat(c, 1, 1, 1, 1)
+        ky = ky.repeat(c, 1, 1, 1, 1)
+        kz = kz.repeat(c, 1, 1, 1, 1)
+
+        gx = F.conv3d(vol, kx, padding=(0, 0, 1), groups=c)
+        gy = F.conv3d(vol, ky, padding=(0, 1, 0), groups=c)
+        gz = F.conv3d(vol, kz, padding=(1, 0, 0), groups=c)
+        return gx, gy, gz
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+        """Return mean L1 between gradients."""
+        if pred.dim() == 4:
+            gx_p, gy_p = self._grad_2d(pred)
+            gx_t, gy_t = self._grad_2d(target)
+            loss = F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t)
+            return loss * 0.5
+        elif pred.dim() == 5:
+            gx_p, gy_p, gz_p = self._grad_3d(pred)
+            gx_t, gy_t, gz_t = self._grad_3d(target)
+            loss = F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t) + F.l1_loss(gz_p, gz_t)
+            return loss / 3.0
+        else:
+            raise ValueError(f"Unsupported tensor dimensionality for GradientLoss: {pred.dim()}")
+
+
 class MS_SSIMLoss(nn.Module):
     """
     Multi-Scale SSIM loss.
@@ -330,13 +429,16 @@ class CombinedLoss(nn.Module):
         channel (int): Number of channels
     """
     def __init__(self, ssim_weight: float = 0.84, l1_weight: float = 0.16, 
-                 window_size: int = 11, channel: int = 1):
+                 window_size: int = 11, channel: int = 1, grad_weight: float = 0.0):
         super(CombinedLoss, self).__init__()
         self.ssim_weight = ssim_weight
         self.l1_weight = l1_weight
+        self.grad_weight = grad_weight
         
         self.ssim_loss = SSIMLoss(window_size=window_size, channel=channel)
         self.l1_loss = nn.L1Loss()
+        # Gradient loss (2D) will be created lazily if requested
+        self.grad_loss = None
     
     def forward(self, img1: torch.Tensor, img2: torch.Tensor):
         """
@@ -351,8 +453,173 @@ class CombinedLoss(nn.Module):
         """
         ssim = self.ssim_loss(img1, img2) * self.ssim_weight
         l1 = self.l1_loss(img1, img2) * self.l1_weight
+        total = ssim + l1
+
+        if self.grad_weight > 0.0:
+            if self.grad_loss is None:
+                self.grad_loss = GradientLoss(is_3d=False).to(img1.device)
+            g = self.grad_loss(img1, img2) * self.grad_weight
+            total = total + g
+
+        return total
+
+
+class SSIM3DLoss(nn.Module):
+    """
+    3D Structural Similarity Index (SSIM) loss for volumetric data.
+    
+    Extends SSIM to 3D by using 3D Gaussian windows and computing
+    structural similarity across all three spatial dimensions (D, H, W).
+    
+    Critical for 3D volumetric models where Z-dimension relationships matter.
+    
+    Loss is computed as: 1 - SSIM (so lower is better)
+    
+    Args:
+        window_size (int): Size of the 3D Gaussian window (default: 11)
+        size_average (bool): Whether to average the loss over the batch
+        channel (int): Number of channels (typically 1 for microscopy)
+    
+    Note:
+        Input tensors should have shape [B, C, D, H, W] where D is depth.
+        For Z-context models with shape [B, C, H, W] where C contains Z-planes,
+        use regular SSIMLoss instead (treats each plane independently).
+    """
+    def __init__(self, window_size: int = 11, size_average: bool = True, channel: int = 1):
+        super(SSIM3DLoss, self).__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.channel = channel
         
-        return ssim + l1
+        # Create 3D Gaussian window
+        self.window = self._create_window_3d(window_size, channel)
+    
+    def _gaussian(self, window_size: int, sigma: float):
+        """Create 1D Gaussian kernel."""
+        gauss = torch.Tensor([
+            torch.exp(torch.tensor(-(x - window_size//2)**2 / float(2*sigma**2))) 
+            for x in range(window_size)
+        ])
+        return gauss / gauss.sum()
+    
+    def _create_window_3d(self, window_size: int, channel: int):
+        """Create 3D Gaussian window."""
+        gauss = self._gaussian(window_size, 1.5)
+        # Outer product to form 3D separable window: gauss(d) * gauss(h) * gauss(w)
+        w3 = gauss.view(window_size, 1, 1) * gauss.view(1, window_size, 1) * gauss.view(1, 1, window_size)
+        # Shape to [1,1,D,H,W] then expand per channel
+        window = w3.unsqueeze(0).unsqueeze(0).expand(channel, 1, window_size, window_size, window_size).contiguous()
+        return window.float()
+    
+    def _ssim3d(self, img1: torch.Tensor, img2: torch.Tensor, window: torch.Tensor, 
+                window_size: int, channel: int, size_average: bool = True):
+        """Calculate 3D SSIM between two volumes."""
+        # Constants for stability
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        # Move window to same device as images
+        window = window.to(img1.device)
+        
+        pad = window_size // 2
+        
+        # Calculate means using 3D convolution
+        mu1 = F.conv3d(img1, window, padding=pad, groups=channel)
+        mu2 = F.conv3d(img2, window, padding=pad, groups=channel)
+        
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+        
+        # Calculate variances and covariance
+        sigma1_sq = F.conv3d(img1 * img1, window, padding=pad, groups=channel) - mu1_sq
+        sigma2_sq = F.conv3d(img2 * img2, window, padding=pad, groups=channel) - mu2_sq
+        sigma12 = F.conv3d(img1 * img2, window, padding=pad, groups=channel) - mu1_mu2
+        
+        # 3D SSIM formula
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        if size_average:
+            return ssim_map.mean()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1).mean(1)
+    
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor):
+        """
+        Calculate 3D SSIM loss.
+        
+        Args:
+            img1 (torch.Tensor): First volume (B, C, D, H, W)
+            img2 (torch.Tensor): Second volume (B, C, D, H, W)
+        
+        Returns:
+            torch.Tensor: 3D SSIM loss (1 - SSIM, so lower is better)
+        """
+        if img1.dim() != 5:
+            raise ValueError(f"Expected 5D input [B,C,D,H,W], got {img1.dim()}D with shape {img1.shape}")
+        
+        (_, channel, _, _, _) = img1.size()
+        
+        # Recreate window if channel changed
+        if channel != self.channel:
+            self.window = self._create_window_3d(self.window_size, channel)
+            self.channel = channel
+        
+        # Calculate 3D SSIM
+        ssim_value = self._ssim3d(img1, img2, self.window, self.window_size, 
+                                  channel, self.size_average)
+        
+        # Return loss (1 - SSIM)
+        return 1 - ssim_value
+
+
+class Combined3DLoss(nn.Module):
+    """
+    Combined 3D loss: 3D SSIM + L1
+    
+    For volumetric data, combines 3D structural similarity with pixel-wise L1.
+    
+    Args:
+        ssim_weight (float): Weight for 3D SSIM loss (default: 0.84)
+        l1_weight (float): Weight for L1 loss (default: 0.16)
+        window_size (int): 3D SSIM window size
+        channel (int): Number of channels
+    """
+    def __init__(self, ssim_weight: float = 0.84, l1_weight: float = 0.16, 
+                 window_size: int = 11, channel: int = 1, grad_weight: float = 0.0):
+        super(Combined3DLoss, self).__init__()
+        self.ssim_weight = ssim_weight
+        self.l1_weight = l1_weight
+        self.grad_weight = grad_weight
+        
+        self.ssim_loss = SSIM3DLoss(window_size=window_size, channel=channel)
+        self.l1_loss = nn.L1Loss()
+        # Gradient loss (3D) will be created lazily if requested
+        self.grad_loss = None
+    
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor):
+        """
+        Calculate combined 3D SSIM + L1 loss.
+        
+        Args:
+            img1 (torch.Tensor): First volume (B, C, D, H, W)
+            img2 (torch.Tensor): Second volume (B, C, D, H, W)
+        
+        Returns:
+            torch.Tensor: Combined 3D loss
+        """
+        ssim = self.ssim_loss(img1, img2) * self.ssim_weight
+        l1 = self.l1_loss(img1, img2) * self.l1_weight
+        total = ssim + l1
+
+        if getattr(self, 'grad_weight', 0.0) > 0.0:
+            if self.grad_loss is None:
+                self.grad_loss = GradientLoss(is_3d=True).to(img1.device)
+            g = self.grad_loss(img1, img2) * self.grad_weight
+            total = total + g
+
+        return total
 
 
 class PerceptualLoss(nn.Module):
@@ -418,13 +685,20 @@ class CycleCarelosses:
         # For combined loss, get weights from config
         ssim_weight = getattr(config, 'SSIM_WEIGHT', 0.84)
         l1_weight = getattr(config, 'L1_WEIGHT', 0.16)
+        grad_weight = getattr(config, 'GRAD_LOSS_WEIGHT', 0.0)
+        # Optional SSIM window sizes (tune for your cell size)
+        ssim_window_2d = getattr(config, 'SSIM_WINDOW', 7)
+        ssim_window_3d = getattr(config, 'SSIM3D_WINDOW', 5)
         
         # Initialize loss functions
         self.gan_loss = GANLoss(gan_mode='lsgan').to(device)
         self.cycle_loss = CycleConsistencyLoss(
             loss_type=cycle_loss_type, 
             ssim_weight=ssim_weight, 
-            l1_weight=l1_weight
+            l1_weight=l1_weight,
+            grad_weight=grad_weight,
+            ssim_window_2d=ssim_window_2d,
+            ssim_window_3d=ssim_window_3d
         ).to(device)
         self.identity_loss = IdentityLoss(loss_type=identity_loss_type).to(device)
         
@@ -438,7 +712,7 @@ class CycleCarelosses:
         print(f"  Cycle loss type: {cycle_loss_type}")
         print(f"  Identity loss type: {identity_loss_type}")
         if cycle_loss_type == 'combined':
-            print(f"  SSIM weight: {ssim_weight}, L1 weight: {l1_weight}")
+            print(f"  SSIM weight: {ssim_weight}, L1 weight: {l1_weight}, Grad weight: {grad_weight}")
         print(f"  Lambda values: cycle={self.lambda_cycle}, identity={self.lambda_identity}, adv={self.lambda_adv}")
     
     def compute_generator_loss(self, model, real_A, real_B, D_A, D_B):
@@ -639,12 +913,48 @@ def test_losses():
     print(f"   MS-SSIM Loss: {loss.item():.4f}")
     print("   ✓ Test passed!")
     
+    # Test 3D SSIM loss
+    print("\n8. Testing 3D SSIM Loss...")
+    depth = 16
+    vol1 = torch.randn(batch_size, channels, depth, height, width)
+    vol2 = torch.randn(batch_size, channels, depth, height, width)
+    ssim_3d_loss = SSIM3DLoss(window_size=11, channel=1)
+    loss = ssim_3d_loss(vol1, vol2)
+    print(f"   3D SSIM Loss: {loss.item():.4f}")
+    print(f"   Input shape: {vol1.shape} (5D volumetric)")
+    print("   ✓ Test passed!")
+    
+    # Test 3D Combined loss
+    print("\n9. Testing 3D Combined Loss...")
+    combined_3d_loss = Combined3DLoss(ssim_weight=0.84, l1_weight=0.16, channel=1)
+    loss = combined_3d_loss(vol1, vol2)
+    print(f"   3D Combined Loss: {loss.item():.4f}")
+    print("   ✓ Test passed!")
+    
+    # Test auto-detection in CycleConsistencyLoss
+    print("\n10. Testing Auto-Detection (2D vs 3D)...")
+    cycle_loss_auto = CycleConsistencyLoss(loss_type='ssim')
+    loss_2d = cycle_loss_auto(reconstructed, real)
+    loss_3d = cycle_loss_auto(vol1, vol2)
+    print(f"   2D input loss: {loss_2d.item():.4f} (shape: {real.shape})")
+    print(f"   3D input loss: {loss_3d.item():.4f} (shape: {vol1.shape})")
+    print("   ✓ Auto-detection works!")
+    
     print("\n✓ All loss tests passed!")
-    print("\nComparison summary:")
-    print("  - L1: Pixel-wise absolute difference, sharp but can be blocky")
-    print("  - SSIM: Structural similarity, preserves texture and detail")
-    print("  - Combined: Best of both worlds - structure + pixel accuracy")
-    print("\nRecommendation for denoising: Use 'combined' or 'ssim' for better quality!")
+    print("\nLoss Function Summary:")
+    print("="*60)
+    print("2D Losses (for Z-context models with shape [B,C,H,W]):")
+    print("  - L1: Pixel-wise absolute difference, sharp but blocky")
+    print("  - SSIM: Structural similarity per Z-plane independently")
+    print("  - Combined: SSIM + L1 (recommended for 2D/2.5D denoising)")
+    print("\n3D Losses (for volumetric models with shape [B,C,D,H,W]):")
+    print("  - SSIM3D: True volumetric structural similarity")
+    print("  - Combined3D: 3D SSIM + L1 (recommended for 3D denoising)")
+    print("\nKey Differences:")
+    print("  • 2D SSIM: Treats each Z-plane independently")
+    print("  • 3D SSIM: Computes similarity across all 3 dimensions")
+    print("  • Auto-detection: CycleConsistencyLoss picks correct version")
+    print("="*60)
 
 
 if __name__ == "__main__":

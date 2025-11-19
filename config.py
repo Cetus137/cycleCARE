@@ -75,7 +75,15 @@ class Config:
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
     SSIM_WEIGHT = 0.84        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 0.16      
+    L1_WEIGHT = 0.16          # Weight for L1 component (typically 0.16)
+    GRAD_LOSS_WEIGHT = 0.5    # Weight for gradient loss (preserves edges/morphology)
+                              # Recommended: 0.5-1.0 to emphasize fine structure
+                              # Set to 0.0 to disable
+    
+    # SSIM window sizes (should be smaller than your cell size)
+    # For ~30 pixel cells: use window_size=7 (covers ~23% of cell)
+    SSIM_WINDOW = 7           # 2D SSIM window size (default: 7 for 128×128 images)
+    SSIM3D_WINDOW = 5         # 3D SSIM window size (default: 5 for shallow 5-plane stacks)      
     
     # Learning rate scheduling
     LR_DECAY_START_EPOCH = 100  # Epoch to start decaying learning rate
