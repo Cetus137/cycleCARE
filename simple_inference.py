@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 def load_model(checkpoint_path, device='cuda'):
     """
-    Load the trained model from checkpoint.
+    Load the trained model from checkpoint by inferring architecture from weights.
     
     Returns:
         tuple: (model, zstack_context)
@@ -36,153 +36,61 @@ def load_model(checkpoint_path, device='cuda'):
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Get config from checkpoint
-    cfg = None
-    if 'config' in checkpoint:
-        cfg = checkpoint['config']
-        
-        # Handle both dict (new format) and Config object (old format)
-        if isinstance(cfg, dict):
-            unet_depth = cfg.get('UNET_DEPTH', 2)
-            unet_filters = cfg.get('UNET_FILTERS', 64)
-            img_channels = cfg.get('IMG_CHANNELS', 1)
-            zstack_context = cfg.get('ZSTACK_CONTEXT', img_channels)  # For backward compat
-            print(f"Loaded config from checkpoint (dict): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
-            if zstack_context > 1:
-                print(f"  Z-stack mode: {zstack_context}-plane context")
-        else:
-            # Old format: Config object with class-level attributes
-            unet_depth = getattr(cfg, 'UNET_DEPTH', 2)
-            unet_filters = getattr(cfg, 'UNET_FILTERS', 64)
-            img_channels = getattr(cfg, 'IMG_CHANNELS', 1)
-            zstack_context = getattr(cfg, 'ZSTACK_CONTEXT', img_channels)
-            print(f"Loaded config from checkpoint (object): UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
-            if zstack_context > 1:
-                print(f"  Z-stack mode: {zstack_context}-plane context")
-            print("  WARNING: Old checkpoint format detected. Config may not reflect actual training settings.")
-            print("  Verifying against model weights...")
-            
-            # For old format, verify against actual weights
-            state_dict = checkpoint['model_state_dict']
-            max_encoder_idx = -1
-            for key in state_dict.keys():
-                if 'encoder_blocks.' in key:
-                    idx = int(key.split('encoder_blocks.')[1].split('.')[0])
-                    max_encoder_idx = max(max_encoder_idx, idx)
-            
-            if max_encoder_idx >= 0:
-                actual_depth = max_encoder_idx + 1
-                if actual_depth != unet_depth:
-                    print(f"  ⚠️  Config mismatch detected! Using actual UNET_DEPTH={actual_depth} from weights (config says {unet_depth})")
-                    unet_depth = actual_depth
-    else:
-        # Infer architecture from state_dict
-        print("Config not in checkpoint, inferring from model weights...")
-        state_dict = checkpoint['model_state_dict']
-        
-        # Find maximum encoder block index
-        max_encoder_idx = -1
-        for key in state_dict.keys():
-            if 'encoder_blocks.' in key:
-                # Extract index from keys like "G_AB.encoder_blocks.2.conv1..."
-                idx = int(key.split('encoder_blocks.')[1].split('.')[0])
-                max_encoder_idx = max(max_encoder_idx, idx)
-        
-        # UNET_DEPTH = max_encoder_idx + 1 (since indices start at 0)
-        unet_depth = max_encoder_idx + 1 if max_encoder_idx >= 0 else 2
-        
-        # Infer filters from bottleneck size
-        # Bottleneck has shape [filters * (2^depth), filters * (2^depth), 3, 3]
-        for key in state_dict.keys():
-            if 'bottleneck.0.block.0.weight' in key:
-                bottleneck_size = state_dict[key].shape[0]
-                unet_filters = bottleneck_size // (2 ** unet_depth)
-                break
-        else:
-            unet_filters = 64  # default
-        
-        img_channels = 1  # default for grayscale
-        zstack_context = img_channels  # Assume Z-stack context equals img_channels
-        
-        print(f"Inferred architecture: UNET_DEPTH={unet_depth}, UNET_FILTERS={unet_filters}, IMG_CHANNELS={img_channels}")
+    # Get state dict
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
     
-    # Decide whether the checkpoint is 3D (Conv3d weights present)
-    try:
-        from models.cycle_care_3d import CycleCARE3D
-    except Exception:
-        CycleCARE3D = None
-
-    state = checkpoint.get('model_state_dict', checkpoint)
-    is_3d_ckpt = False
-    # Detect any 5D conv weight tensors in the state dict
-    for v in state.values():
-        if isinstance(v, torch.Tensor) and v.dim() == 5:
-            is_3d_ckpt = True
+    print("Inferring model architecture from checkpoint weights...")
+    
+    # 1. Infer img_channels (Z-stack context) from first conv layer
+    img_channels = 1
+    for key in state_dict.keys():
+        if 'G_AB.initial_conv.0.block.0.weight' in key:
+            # Shape: [out_channels, in_channels, kernel_h, kernel_w]
+            img_channels = state_dict[key].shape[1]
             break
-
-    if is_3d_ckpt and CycleCARE3D is not None:
-        # Read architecture from config for 3D model
-        disc_f = cfg.get('DISC_FILTERS', 32) if isinstance(cfg, dict) else getattr(cfg, 'DISC_FILTERS', 32)
-        disc_layers = cfg.get('DISC_NUM_LAYERS', 2) if isinstance(cfg, dict) else getattr(cfg, 'DISC_NUM_LAYERS', 2)
-        disc_kernel = cfg.get('DISC_KERNEL_SIZE', 3) if isinstance(cfg, dict) else getattr(cfg, 'DISC_KERNEL_SIZE', 3)
-        unet_kernel = cfg.get('UNET_KERNEL_SIZE', 3) if isinstance(cfg, dict) else getattr(cfg, 'UNET_KERNEL_SIZE', 3)
-        use_bn = cfg.get('USE_BATCH_NORM', True) if isinstance(cfg, dict) else getattr(cfg, 'USE_BATCH_NORM', True)
-        use_drop = cfg.get('USE_DROPOUT', True) if isinstance(cfg, dict) else getattr(cfg, 'USE_DROPOUT', True)
-        drop_rate = cfg.get('DROPOUT_RATE', 0.5) if isinstance(cfg, dict) else getattr(cfg, 'DROPOUT_RATE', 0.5)
-        
-        # Determine expected volume depth (z-context) from config if present
-        if isinstance(cfg, dict):
-            zstack_context = cfg.get('VOLUME_DEPTH', cfg.get('ZSTACK_CONTEXT', img_channels))
-        else:
-            zstack_context = getattr(cfg, 'VOLUME_DEPTH', getattr(cfg, 'ZSTACK_CONTEXT', img_channels))
-
-        model = CycleCARE3D(
-            img_channels=img_channels,
-            unet_depth=unet_depth,
-            unet_filters=unet_filters,
-            unet_kernel_size=unet_kernel,
-            disc_filters=disc_f,
-            disc_num_layers=disc_layers,
-            disc_kernel_size=disc_kernel,
-            use_batch_norm=use_bn,
-            use_dropout=use_drop,
-            dropout_rate=drop_rate
-        ).to(device)
-
-        # Load weights with non-strict loading to tolerate key differences
-        try:
-            model.load_state_dict(state, strict=False)
-        except Exception as e:
-            print(f"  Warning: Could not load some weights: {e}")
-
-        model.eval()
-        print(f"✓ 3D model loaded from {checkpoint_path}")
-        print(f"  Architecture: depth={unet_depth}, filters={unet_filters}, volume_depth={zstack_context}")
-        return model, zstack_context
-    else:
-        # Build legacy 2D model and load state dict loosely to avoid missing/unexpected key errors
-        model = CycleCARE(
-            img_channels=img_channels,
-            unet_depth=unet_depth,
-            unet_filters=unet_filters,
-            unet_kernel_size=3,
-            disc_filters=64,
-            disc_num_layers=3,
-            disc_kernel_size=4,
-            use_batch_norm=True,
-            use_dropout=True,
-            dropout_rate=0.5
-        ).to(device)
-
-        try:
-            model.load_state_dict(state, strict=False)
-        except Exception:
-            # Last resort: try strict load (will raise helpful error)
-            model.load_state_dict(state)
-
-        model.eval()
-        print(f"✓ 2D model loaded successfully from {checkpoint_path}")
-        return model, zstack_context
+    
+    # 2. Infer unet_depth from encoder blocks
+    max_encoder_idx = -1
+    for key in state_dict.keys():
+        if 'encoder_blocks.' in key:
+            idx = int(key.split('encoder_blocks.')[1].split('.')[0])
+            max_encoder_idx = max(max_encoder_idx, idx)
+    unet_depth = max_encoder_idx + 1 if max_encoder_idx >= 0 else 2
+    
+    # 3. Infer unet_filters from bottleneck
+    unet_filters = 64  # default
+    for key in state_dict.keys():
+        if 'bottleneck.0.block.0.weight' in key:
+            bottleneck_channels = state_dict[key].shape[0]
+            unet_filters = bottleneck_channels // (2 ** unet_depth)
+            break
+    
+    zstack_context = img_channels
+    
+    print(f"  UNET_DEPTH: {unet_depth}")
+    print(f"  UNET_FILTERS: {unet_filters}")
+    print(f"  IMG_CHANNELS: {img_channels}")
+    print(f"  ZSTACK_CONTEXT: {zstack_context}")
+    
+    # Build and load model
+    model = CycleCARE(
+        img_channels=img_channels,
+        unet_depth=unet_depth,
+        unet_filters=unet_filters,
+        unet_kernel_size=3,
+        disc_filters=64,
+        disc_num_layers=3,
+        disc_kernel_size=4,
+        use_batch_norm=True,
+        use_dropout=True,
+        dropout_rate=0.5
+    ).to(device)
+    
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    
+    print(f"✓ Model loaded from {checkpoint_path}")
+    return model, zstack_context
 
 
 def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0):
@@ -665,7 +573,7 @@ def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, ov
     return output.astype(np.float32)
 
 
-def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128, zstack_context=1):
+def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1):
     """
     Restore a Z-stack using multi-plane context if model was trained with it.
     
@@ -683,38 +591,10 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     Returns:
         Restored Z-stack as float32 numpy array (Z, H, W) in [0, 1] range
     """
-    print(f"\nProcessing Z-stack: {zstack_path}")
+    print(f"\nProcessing Z-stack: with {zstack_context}-plane context")
     
     if zstack_context > 1:
         print(f"  Using {zstack_context}-plane context window")
-    
-    # Try to load as multi-page TIFF
-    try:
-        # Try tifffile first (better for scientific images)
-        try:
-            import tifffile
-            zstack = tifffile.imread(zstack_path)
-        except ImportError:
-            # Fallback to PIL
-            img = Image.open(zstack_path)
-            planes = []
-            try:
-                i = 0
-                while True:
-                    img.seek(i)
-                    planes.append(np.array(img))
-                    i += 1
-            except EOFError:
-                pass
-            zstack = np.array(planes)
-            
-    except Exception as e:
-        print(f"Error loading Z-stack: {e}")
-        print("Treating as single plane image")
-        img = Image.open(zstack_path)
-        zstack = np.array(img)
-        if len(zstack.shape) == 2:
-            zstack = zstack[np.newaxis, :, :]  # Add Z dimension
     
     # Check if we have a Z-stack
     if len(zstack.shape) == 2:
@@ -812,36 +692,6 @@ def restore_zstack(model, zstack_path, output_path, device='cuda', tile_size=128
     
     # Stack planes back together
     restored_zstack = np.array(restored_planes)
-    
-    # Save result
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    if num_planes == 1:
-        # Single plane - save with same logic as restore_image
-        if output_path.suffix.lower() in ['.tif', '.tiff']:
-            if tifffile is not None:
-                tifffile.imwrite(output_path, restored_zstack[0])
-            else:
-                # Fallback: convert to uint16 for PIL
-                restored_uint16 = (restored_zstack[0] * 65535).astype(np.uint16)
-                Image.fromarray(restored_uint16).save(output_path)
-        else:
-            # For PNG, JPG etc: convert to uint8
-            restored_uint8 = (restored_zstack[0] * 255).astype(np.uint8)
-            Image.fromarray(restored_uint8).save(output_path)
-    else:
-        # Z-stack - save as multi-page TIFF (always float32 with tifffile, or uint16 fallback)
-        if tifffile is not None:
-            tifffile.imwrite(output_path, restored_zstack)
-        else:
-            # Fallback: convert to uint16 for PIL multi-page TIFF
-            restored_uint16 = (restored_zstack * 65535).astype(np.uint16)
-            images = [Image.fromarray(plane) for plane in restored_uint16]
-            images[0].save(output_path, save_all=True, append_images=images[1:])
-    
-    print(f"  ✓ Saved to: {output_path}")
-    
     return restored_zstack
 
 
@@ -889,13 +739,13 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
     return restored
 
 
-def denoise_zstack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128):
+def denoise_zstack(checkpoint_path, zstack, device='cuda', tile_size=128):
     """
     Denoise a Z-stack (multi-plane TIFF) by processing each plane independently.
     
     Args:
         checkpoint_path: Path to model checkpoint
-        input_path: Path to input Z-stack (multi-page TIFF)
+        zstack: Input Z-stack as a numpy array (Z, H, W)
         output_path: Path to save restored Z-stack (saved as float32 TIFF)
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size for large images (default 128)
@@ -914,7 +764,7 @@ def denoise_zstack(checkpoint_path, input_path, output_path, device='cuda', tile
     print(f"Using device: {device}")
     
     model, zstack_context = load_model(checkpoint_path, device=device)
-    restored = restore_zstack(model, input_path, output_path, device=device, tile_size=tile_size, zstack_context=zstack_context)
+    restored = restore_zstack(model, zstack, device=device, tile_size=tile_size, zstack_context=zstack_context)
     
     print("✓ Done!")
     return restored
@@ -975,10 +825,83 @@ def denoise_batch(checkpoint_path, input_dir, output_dir, device='cuda', tile_si
     print(f"\n✓ Batch processing complete! Results in: {output_dir}")
 
 
+def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128):
+    """Denoise a single multi-dimensional time-lapse TIFF stack with Z-context.
+
+    Expected input dimensions (TCZYX or TZYX):
+      - 5D: (T, C, Z, Y, X) with C == 1 (singleton channel) -> processed as (T, Z, Y, X)
+      - 4D: (T, Z, Y, X)
+
+    For each timepoint, processes the Z-stack using the same logic as denoise_zstack.
+
+    Args:
+        checkpoint_path: Path to model checkpoint (.pth)
+        input_path: Path to input multi-dim TIFF stack (TCZYX or TZYX)
+        output_path: Path to output restored stack (same dimensionality)
+        device: 'cuda' or 'cpu'
+        tile_size: Tile size for large XY images
+
+    Returns:
+        Restored stack as float32 numpy array with same shape as input.
+    """
+    
+    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
+    # Load model and obtain expected Z-context size
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    print(f"Model Z-context: {zstack_context} channel(s)")
+
+    # Load the image stack
+    arr = tifffile.imread(str(input_path))
+    orig_shape = arr.shape
+    print(f"Loaded stack shape: {orig_shape}")
+
+    # Normalize dimensionality
+    if arr.ndim == 5:  # (T,C,Z,Y,X)
+        T, C, Z, Y, X = arr.shape
+        if C != 1:
+            raise ValueError(f"Multi-channel (C={C}) stacks not supported – expected singleton C=1")
+        arr = arr.reshape(T, Z, Y, X)  # drop singleton C
+    elif arr.ndim == 4:  # (T,Z,Y,X)
+        T, Z, Y, X = arr.shape
+    elif arr.ndim == 3:  # (Z,Y,X) single timepoint
+        Z, Y, X = arr.shape
+        T = 1
+        arr = arr[np.newaxis, :, :, :]  # add time dim
+
+    print(f"Detected {T} timepoints with Z-stack shape: ({Z}, {Y}, {X})")
+
+    # Prepare output array (float32 in [0,1])
+    restored = np.zeros((T, Z, Y, X), dtype=np.float32)
+    half_context = zstack_context // 2
+
+    #please convert the input array to float32 for processing
+    arr = arr.astype(np.float32)
+
+    # Process each timepoint
+    print("Beginning timelapse denoising...")
+    for i in range(T):
+        print(f"Processing timepoint {i+1}/{T}...")
+        zstack = arr[i]  # (Z, Y, X)
+        restored_zstack  = denoise_zstack(checkpoint_path=checkpoint_path,
+                                            zstack=zstack,
+                                            device=device,
+                                            tile_size=tile_size)
+        restored[i] = restored_zstack
+
+    # Save output preserving shape
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(output_path), restored)
+
+    print(f"✓ Saved restored timelapse stack to {output_path}")
+    return restored
+
 if __name__ == "__main__":
     # Example usage - uncomment the one you want to run:
-    denoise_zstack(
-        checkpoint_path= '/Users/ewheeler/cycleCARE_HPC/outputs/checkpoints/checkpoint_epoch_0080.pth',
-        input_path     = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49.tif',
-        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_deskew_cgt-cropped_for_segmentation_T49_restored_3D.tif',
+    denoise_timelapse_stack(
+        checkpoint_path= '/Users/ewheeler/Downloads/checkpoint_epoch_0080.pth',
+        input_path     = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_crop_t1_z50-359_y750-1262_x1000-1512.tif',
+        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_crop_t1_z50-359_y750-1262_x1000-1512_restored.tif',
     )
