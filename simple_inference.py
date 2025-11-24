@@ -87,7 +87,8 @@ def load_model(checkpoint_path, device='cuda'):
     return model, zstack_context
 
 
-def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0):
+def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0, 
+                     norm_min=None, norm_max=None):
     """
     Convert image to tensor and normalize.
     Uses percentile-based normalization for fluorescence microscopy.
@@ -97,6 +98,8 @@ def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, 
         use_percentile_norm: If True, normalize to percentile instead of min/max (recommended for fluorescence)
         percentile_low: Lower percentile for normalization (default 0.0)
         percentile_high: Upper percentile for normalization (default 99.0)
+        norm_min: Pre-computed minimum value for normalization (overrides percentile_low if provided)
+        norm_max: Pre-computed maximum value for normalization (overrides percentile_high if provided)
     
     Returns:
         Normalized tensor in [-1, 1] range
@@ -115,28 +118,28 @@ def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, 
         image_array = image_array.astype(np.float32)
     
     # Normalize to [0, 1] range using percentile-based normalization
-    if use_percentile_norm:
+    if norm_min is not None and norm_max is not None:
+        # Use pre-computed normalization parameters (for global Z-stack normalization)
+        p_min = norm_min
+        p_max = norm_max
+    elif use_percentile_norm:
         # Percentile-based normalization (robust to outliers in fluorescence)
         p_min = np.percentile(image_array, percentile_low)  # Lower percentile (default 1%)
         p_max = np.percentile(image_array, percentile_high)  # Upper percentile (default 99%)
-        
-        # Avoid division by zero
-        if p_max - p_min < 1e-8:
-            print(f"  Warning: Very low contrast image (p{percentile_low}={p_min:.3f}, p{percentile_high}={p_max:.3f})")
-            image_array = np.zeros_like(image_array)
-        else:
-            # Normalize to [0, 1] based on percentiles
-            image_array = (image_array - p_min) / (p_max - p_min)
-            # Clip to [0, 1] (values outside percentile range get clipped)
-            image_array = np.clip(image_array, 0.0, 1.0)
     else:
         # Simple min-max normalization (legacy behavior)
-        img_min = image_array.min()
-        img_max = image_array.max()
-        if img_max - img_min < 1e-8:
-            image_array = np.zeros_like(image_array)
-        else:
-            image_array = (image_array - img_min) / (img_max - img_min)
+        p_min = image_array.min()
+        p_max = image_array.max()
+    
+    # Avoid division by zero
+    if p_max - p_min < 1e-8:
+        print(f"  Warning: Very low contrast image (min={p_min:.3f}, max={p_max:.3f})")
+        image_array = np.zeros_like(image_array)
+    else:
+        # Normalize to [0, 1] based on min/max
+        image_array = (image_array - p_min) / (p_max - p_min)
+        # Clip to [0, 1] (values outside range get clipped)
+        image_array = np.clip(image_array, 0.0, 1.0)
     
     # Convert to tensor
     tensor = torch.from_numpy(image_array).float()
@@ -567,7 +570,9 @@ def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, ov
     return output.astype(np.float32)
 
 
-def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1):
+def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1, 
+                   percentile_low=1.0, percentile_high=99.0, normalization_type='global', 
+                   sliding_window_size=20):
     """
     Restore a Z-stack using multi-plane context if model was trained with it.
     
@@ -581,6 +586,13 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size for tiling (default 128)
         zstack_context: Number of adjacent planes to use as input (1 = single plane, 5 = use 5-plane context)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+        normalization_type: Type of normalization to use (default 'global')
+            - 'global': Compute normalization values once across entire Z-stack (prevents stripe artifacts)
+            - 'per_plane': Normalize each plane independently (may cause stripe artifacts)
+            - 'sliding_window': Use sliding window of planes for local normalization
+        sliding_window_size: Number of planes in sliding window for 'sliding_window' normalization (default 20)
     
     Returns:
         Restored Z-stack as float32 numpy array (Z, H, W) in [0, 1] range
@@ -603,12 +615,47 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
     else:
         raise ValueError(f"Unexpected array shape: {zstack.shape}")
     
+    # Compute normalization values based on selected method
+    if normalization_type == 'global':
+        # Global normalization: compute once across entire Z-stack (prevents stripe artifacts)
+        global_p_min = np.percentile(zstack, percentile_low)
+        global_p_max = np.percentile(zstack, percentile_high)
+        print(f"  Global normalization: p{percentile_low}={global_p_min:.3f}, p{percentile_high}={global_p_max:.3f}")
+    elif normalization_type == 'per_plane':
+        # Per-plane normalization: compute independently for each plane
+        global_p_min = None
+        global_p_max = None
+        print(f"  Per-plane normalization: p{percentile_low}-p{percentile_high}")
+    elif normalization_type == 'sliding_window':
+        # Sliding window normalization: compute from local window of planes
+        global_p_min = None
+        global_p_max = None
+        print(f"  Sliding window normalization: window size={sliding_window_size}, p{percentile_low}-p{percentile_high}")
+    else:
+        raise ValueError(f"Unknown normalization_type: {normalization_type}. Must be 'global', 'per_plane', or 'sliding_window'")
+
+    
     # Process each plane
     restored_planes = []
     half_context = zstack_context // 2
     
     print(f"  Processing {num_planes} plane(s)...")
     for z in tqdm(range(num_planes), desc="Denoising planes"):
+        
+        # Compute sliding window normalization values if needed
+        if normalization_type == 'sliding_window':
+            # Define window bounds
+            half_window = sliding_window_size // 2
+            z_start = max(0, z - half_window)
+            z_end = min(num_planes, z + half_window + 1)
+            
+            # Extract window and compute percentiles
+            window_stack = zstack[z_start:z_end]
+            window_p_min = np.percentile(window_stack, percentile_low)
+            window_p_max = np.percentile(window_stack, percentile_high)
+        else:
+            window_p_min = global_p_min
+            window_p_max = global_p_max
         
         if zstack_context > 1:
             # Load context planes (sliding window)
@@ -628,10 +675,10 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
                 context_planes.append(plane_ctx)
             
             # Stack context planes: [zstack_context, H, W]
-            # Each plane preprocessed individually, then stacked
+            # Each plane preprocessed with appropriate normalization values
             context_tensors = []
             for plane_ctx in context_planes:
-                tensor_ctx = preprocess_image(plane_ctx)  # Returns [1, H, W]
+                tensor_ctx = preprocess_image(plane_ctx, norm_min=window_p_min, norm_max=window_p_max)  # Returns [1, H, W]
                 context_tensors.append(tensor_ctx)
             
             # Stack to [zstack_context, H, W]
@@ -649,7 +696,7 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
             else:
                 h, w = plane.shape
             
-            stacked_input = preprocess_image(plane)  # [1, H, W]
+            stacked_input = preprocess_image(plane, norm_min=window_p_min, norm_max=window_p_max)  # [1, H, W]
         
         # Check if tiling is needed
         _, h, w = stacked_input.shape  # Get dimensions from tensor
@@ -733,7 +780,9 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
     return restored
 
 
-def denoise_zstack(checkpoint_path, zstack, model, zstack_context, device='cuda', tile_size=128):
+def denoise_zstack(checkpoint_path, zstack, device='cuda', tile_size=128, 
+                   percentile_low=1.0, percentile_high=99.0, normalization_type='global',
+                   sliding_window_size=20):
     """
     Denoise a Z-stack (multi-plane TIFF) by processing each plane independently.
     
@@ -743,6 +792,10 @@ def denoise_zstack(checkpoint_path, zstack, model, zstack_context, device='cuda'
         output_path: Path to save restored Z-stack (saved as float32 TIFF)
         device: Device to use ('cuda' or 'cpu')
         tile_size: Tile size for large images (default 128)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+        normalization_type: Type of normalization ('global', 'per_plane', or 'sliding_window', default 'global')
+        sliding_window_size: Window size for sliding window normalization (default 20)
     
     Returns:
         Restored Z-stack as float32 numpy array (Z, H, W) in [0, 1] range
@@ -757,13 +810,74 @@ def denoise_zstack(checkpoint_path, zstack, model, zstack_context, device='cuda'
     device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    restored = restore_zstack(model, zstack, device=device, tile_size=tile_size, zstack_context=zstack_context)
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    restored = restore_zstack(model, zstack, device=device, tile_size=tile_size, 
+                             zstack_context=zstack_context, percentile_low=percentile_low, 
+                             percentile_high=percentile_high, normalization_type=normalization_type,
+                             sliding_window_size=sliding_window_size)
     
     print("✓ Done!")
     return restored
 
 
-def denoise_timelapse_stack(checkpoint_path, input_path, output_path, t_range=None, device='cuda', tile_size=128, three_views = False):
+def denoise_batch(checkpoint_path, input_dir, output_dir, device='cuda', tile_size=128, pattern='*.tif'):
+    """
+    Denoise all images in a directory.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        input_dir: Directory containing input images
+        output_dir: Directory to save restored images
+        device: Device to use ('cuda' or 'cpu')
+        tile_size: Tile size for large images (default 128)
+        pattern: File pattern to match (default '*.tif')
+    
+    Example:
+        denoise_batch(
+            checkpoint_path='outputs/checkpoints/best_model.pth',
+            input_dir='noisy_images/',
+            output_dir='restored_images/',
+            pattern='*.tif'
+        )
+    """
+    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find all matching files
+    files = sorted(input_dir.glob(pattern))
+    if len(files) == 0:
+        print(f"No files matching '{pattern}' found in {input_dir}")
+        return
+    
+    print(f"Found {len(files)} file(s) to process")
+    
+    # Load model once
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    
+    if zstack_context > 1:
+        print(f"⚠️  Model was trained with {zstack_context}-plane Z-stack context.")
+        print(f"   For best results, use denoise_zstack() for Z-stack files.")
+    
+    # Process each file
+    for i, input_path in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] Processing: {input_path.name}")
+        output_path = output_dir / f"{input_path.stem}_restored{input_path.suffix}"
+        
+        try:
+            restore_image(model, input_path, output_path, device=device, tile_size=tile_size)
+        except Exception as e:
+            print(f"  ✗ Error processing {input_path.name}: {e}")
+    
+    print(f"\n✓ Batch processing complete! Results in: {output_dir}")
+
+
+def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128,
+                           percentile_low=1.0, percentile_high=99.0, normalization_type='global',
+                           sliding_window_size=20):
     """Denoise a single multi-dimensional time-lapse TIFF stack with Z-context.
 
     Expected input dimensions (TCZYX or TZYX):
@@ -778,6 +892,10 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, t_range=No
         output_path: Path to output restored stack (same dimensionality)
         device: 'cuda' or 'cpu'
         tile_size: Tile size for large XY images
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+        normalization_type: Type of normalization ('global', 'per_plane', or 'sliding_window', default 'global')
+        sliding_window_size: Window size for sliding window normalization (default 20)
 
     Returns:
         Restored stack as float32 numpy array with same shape as input.
@@ -895,6 +1013,25 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, t_range=No
             tifffile.imwrite(outfile, restored[:,idx,...])
             print(f"✓ Saved restored timepoint {t} of shape {restored[:,idx,...].shape} to {outfile}")
             
+    for i in range(T):
+        print(f"Processing timepoint {i+1}/{T}...")
+        zstack = arr[i]  # (Z, Y, X)
+        restored_zstack  = denoise_zstack(checkpoint_path=checkpoint_path,
+                                            zstack=zstack,
+                                            device=device,
+                                            tile_size=tile_size,
+                                            percentile_low=percentile_low,
+                                            percentile_high=percentile_high,
+                                            normalization_type=normalization_type,
+                                            sliding_window_size=sliding_window_size)
+        restored[i] = restored_zstack
+
+    # Save output preserving shape
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(output_path), restored)
+
+    print(f"✓ Saved restored timelapse stack to {output_path}")
     return restored
 
 if __name__ == "__main__":
