@@ -4,18 +4,12 @@ Automatically tiles large images (>128x128) and processes Z-stacks plane-by-plan
 """
 
 import os
-# Fix for macOS OpenMP library conflict
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
 import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
 import torchvision.transforms as transforms
-try:
-    import tifffile
-except ImportError:
-    tifffile = None
+import tifffile
 from tqdm import tqdm
 
 
@@ -739,7 +733,7 @@ def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda'
     return restored
 
 
-def denoise_zstack(checkpoint_path, zstack, device='cuda', tile_size=128):
+def denoise_zstack(checkpoint_path, zstack, model, zstack_context, device='cuda', tile_size=128):
     """
     Denoise a Z-stack (multi-plane TIFF) by processing each plane independently.
     
@@ -763,69 +757,13 @@ def denoise_zstack(checkpoint_path, zstack, device='cuda', tile_size=128):
     device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    model, zstack_context = load_model(checkpoint_path, device=device)
     restored = restore_zstack(model, zstack, device=device, tile_size=tile_size, zstack_context=zstack_context)
     
     print("✓ Done!")
     return restored
 
 
-def denoise_batch(checkpoint_path, input_dir, output_dir, device='cuda', tile_size=128, pattern='*.tif'):
-    """
-    Denoise all images in a directory.
-    
-    Args:
-        checkpoint_path: Path to model checkpoint
-        input_dir: Directory containing input images
-        output_dir: Directory to save restored images
-        device: Device to use ('cuda' or 'cpu')
-        tile_size: Tile size for large images (default 128)
-        pattern: File pattern to match (default '*.tif')
-    
-    Example:
-        denoise_batch(
-            checkpoint_path='outputs/checkpoints/best_model.pth',
-            input_dir='noisy_images/',
-            output_dir='restored_images/',
-            pattern='*.tif'
-        )
-    """
-    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Find all matching files
-    files = sorted(input_dir.glob(pattern))
-    if len(files) == 0:
-        print(f"No files matching '{pattern}' found in {input_dir}")
-        return
-    
-    print(f"Found {len(files)} file(s) to process")
-    
-    # Load model once
-    model, zstack_context = load_model(checkpoint_path, device=device)
-    
-    if zstack_context > 1:
-        print(f"⚠️  Model was trained with {zstack_context}-plane Z-stack context.")
-        print(f"   For best results, use denoise_zstack() for Z-stack files.")
-    
-    # Process each file
-    for i, input_path in enumerate(files, 1):
-        print(f"\n[{i}/{len(files)}] Processing: {input_path.name}")
-        output_path = output_dir / f"{input_path.stem}_restored{input_path.suffix}"
-        
-        try:
-            restore_image(model, input_path, output_path, device=device, tile_size=tile_size)
-        except Exception as e:
-            print(f"  ✗ Error processing {input_path.name}: {e}")
-    
-    print(f"\n✓ Batch processing complete! Results in: {output_dir}")
-
-
-def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128):
+def denoise_timelapse_stack(checkpoint_path, input_path, output_path, t_range=None, device='cuda', tile_size=128, three_views = False):
     """Denoise a single multi-dimensional time-lapse TIFF stack with Z-context.
 
     Expected input dimensions (TCZYX or TZYX):
@@ -852,10 +790,15 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
     model, zstack_context = load_model(checkpoint_path, device=device)
     print(f"Model Z-context: {zstack_context} channel(s)")
 
+    output_path = Path(output_path)  # if not already a Path
+    output_dir = output_path.parent if not output_path.is_dir() else output_path
+
     # Load the image stack
     arr = tifffile.imread(str(input_path))
     orig_shape = arr.shape
     print(f"Loaded stack shape: {orig_shape}")
+    #please convert the input array to float32 for processing
+    arr = arr.astype(np.float32)
 
     # Normalize dimensionality
     if arr.ndim == 5:  # (T,C,Z,Y,X)
@@ -871,37 +814,132 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
         arr = arr[np.newaxis, :, :, :]  # add time dim
 
     print(f"Detected {T} timepoints with Z-stack shape: ({Z}, {Y}, {X})")
+    n_timepoints = T    
 
-    # Prepare output array (float32 in [0,1])
-    restored = np.zeros((T, Z, Y, X), dtype=np.float32)
-    half_context = zstack_context // 2
 
-    #please convert the input array to float32 for processing
-    arr = arr.astype(np.float32)
+    # Determine which timepoints to process
+    print(t_range)
+    if t_range is None:
+        # Process all timepoints
+        timepoints_to_process = list(range(n_timepoints))
+    elif isinstance(t_range, (list, np.ndarray)):
+        # Process specific timepoints from list
+        timepoints_to_process = list(t_range)
+        # Validate indices
+        if any(t < 0 or t >= n_timepoints for t in timepoints_to_process):
+            raise ValueError(f"t_range contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
+    elif isinstance(t_range, tuple) and len(t_range) == 2:
+        # Process range of timepoints
+        start, end = t_range
+        if start < 0 or end > n_timepoints:
+            raise ValueError(f"t_range ({start}, {end}) out of bounds. Valid range: 0-{n_timepoints}")
+        timepoints_to_process = list(range(start, end))
+    else:
+        raise ValueError("t_range must be None, a list of indices, or a tuple (start, end)")
 
     # Process each timepoint
     print("Beginning timelapse denoising...")
-    for i in range(T):
-        print(f"Processing timepoint {i+1}/{T}...")
-        zstack = arr[i]  # (Z, Y, X)
-        restored_zstack  = denoise_zstack(checkpoint_path=checkpoint_path,
-                                            zstack=zstack,
-                                            device=device,
-                                            tile_size=tile_size)
-        restored[i] = restored_zstack
+    T_range = len(timepoints_to_process)
+    print(three_views)
+    if three_views == False:
+        restored = np.zeros((T_range, Z, Y, X), dtype=np.float32)
 
-    # Save output preserving shape
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(output_path), restored)
+        for idx, t in enumerate(timepoints_to_process):
+            print(f"Processing timepoint {t} ({idx+1}/{len(timepoints_to_process)})")
+            zstack = arr[t]  # (Z, Y, X)
+            restored_zstack  = denoise_zstack(checkpoint_path=checkpoint_path,
+                                                zstack=zstack,
+                                                device=device,
+                                                tile_size=tile_size,
+                                                model=model,
+                                                zstack_context=zstack_context)
+            restored[idx,...] = restored_zstack
+            outfile = output_dir / f'restored_timepoint_{t:04d}.tif'
+            tifffile.imwrite(outfile, restored[idx,...])
+            print(f"✓ Saved restored timepoint {t} of shape {restored[idx,...].shape}")
 
-    print(f"✓ Saved restored timelapse stack to {output_path}")
+    elif three_views == True:
+        restored = np.zeros((3,T_range, Z, Y, X), dtype=np.float32)
+
+        for idx, t in enumerate(timepoints_to_process):
+            print(f"Processing timepoint {t} ({idx+1}/{len(timepoints_to_process)})")
+            zstack = arr[t]  # (3 , Z, Y, X)
+
+            # Create three views: xy , yz, xz
+            zstack_xy = zstack  # original
+            zstack_xz = np.transpose(zstack, (1,0,2))
+            zstack_yz = np.transpose(zstack, (2,0,1))
+
+            restored_xy = denoise_zstack(checkpoint_path=checkpoint_path,
+                                                zstack=zstack_xy,
+                                                device=device,
+                                                tile_size=tile_size,
+                                                model=model,
+                                                zstack_context=zstack_context)
+            restored_xz = denoise_zstack(checkpoint_path=checkpoint_path,
+                                                zstack=zstack_xz,
+                                                device=device,
+                                                tile_size=tile_size,
+                                                model=model,
+                                                zstack_context=zstack_context)
+            restored_yz = denoise_zstack(checkpoint_path=checkpoint_path,
+                                                zstack=zstack_yz,
+                                                device=device,
+                                                tile_size=tile_size,
+                                                model=model,
+                                                zstack_context=zstack_context)
+            restored[0,idx,...] = restored_xy
+            restored[1,idx,...] = np.transpose(restored_xz, (1,0,2))
+            restored[2,idx,...] = np.transpose(restored_yz, (1,2,0))
+            outfile = output_dir / f'restored_timepoint_{t:04d}.tif'
+            tifffile.imwrite(outfile, restored[:,idx,...])
+            print(f"✓ Saved restored timepoint {t} of shape {restored[:,idx,...].shape} to {outfile}")
+            
     return restored
 
 if __name__ == "__main__":
-    # Example usage - uncomment the one you want to run:
-    denoise_timelapse_stack(
-        checkpoint_path= '/Users/ewheeler/Downloads/checkpoint_epoch_0080.pth',
-        input_path     = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_crop_t1_z50-359_y750-1262_x1000-1512.tif',
-        output_path    = '/Users/ewheeler/cycleCARE_HPC/test_data/b2-2a_2c_pos6-01_crop_t1_z50-359_y750-1262_x1000-1512_restored.tif',
-    )
+
+
+    import argparse
+    # Set up command-line argument parser
+    parser = argparse.ArgumentParser(
+        description='Tiled 3D dsnoising (with 3 views) for large timelapses',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+                Examples:
+                # Segment all timepoints with default settings
+                python simple_inference.py --video video.tif --output results/ --model /path/to/model
+                        '''
+                    )
+    
+    parser.add_argument('--checkpoint_path', type=str, help='Path to input checkpoint')
+    parser.add_argument('--input_path'     , type=str, help='Path to input timelapse video (TIFF)')
+    parser.add_argument('--output_path'    , type=str, help='Output path for results')
+    parser.add_argument('--t_range'        , nargs=2, type=int, metavar=('START', 'END'),
+                       help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
+    parser.add_argument('--three_views'    , default=False,
+                       help='whether to use three views denoising', action='store_true')
+    
+    args = parser.parse_args()
+    
+    # Check if running with command-line arguments or using example code
+    if args.input_path and args.output_path and args.checkpoint_path:
+        # Command-line mode
+        print("Running in command-line mode...")
+        
+        # Prepare t_range parameter
+        t_range = None
+        if args.t_range is not None:
+            t_range = tuple(args.t_range)
+            print(f"Processing timepoint range: {t_range[0]} to {t_range[1]}")
+        else:
+            print("Processing all timepoints")
+        
+        denoise_timelapse_stack(
+            checkpoint_path= args.checkpoint_path,
+            input_path     = args.input_path,
+            output_path    = args.output_path,
+            t_range        = args.t_range,
+            three_views    = args.three_views
+        )
+

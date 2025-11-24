@@ -13,19 +13,19 @@ class Config:
     
     # ==================== Paths ====================
     # Data directories - use absolute paths on HPC
-    DATA_ROOT = Path("/Users/ewheeler/cycleCARE/data")
+    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data")
     
     # Two modes supported:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT / "z100_z105_tiles/T0_C0"   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT / "z220_z225_tiles/"   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT /'z100_z105_tiles'   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT /'z220_z225_tiles'   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs")
+    OUTPUT_ROOT = Path("./outputs_grad")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -74,9 +74,9 @@ class Config:
     IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
-    SSIM_WEIGHT = 0.84        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 0.16          # Weight for L1 component (typically 0.16)
-    GRAD_LOSS_WEIGHT = 0.5    # Weight for gradient loss (preserves edges/morphology)
+    SSIM_WEIGHT = 0.00        # Weight for SSIM component (typically 0.84)
+    L1_WEIGHT = 0.25          # Weight for L1 component (typically 0.16)
+    GRAD_LOSS_WEIGHT = 5    # Weight for gradient loss (preserves edges/morphology)
                               # Recommended: 0.5-1.0 to emphasize fine structure
                               # Set to 0.0 to disable
     
@@ -116,12 +116,12 @@ class Config:
     USE_RANDOM_ROTATION = False  # Random rotation (can cause edge artifacts)
     
     # ==================== HPC Training Settings ====================
-    NUM_WORKERS = 8           # Increase workers for HPC (more CPU cores available)
+    NUM_WORKERS = 16           # Increase workers for HPC (more CPU cores available)
     PIN_MEMORY = True         # Pin memory for faster GPU transfer on Linux
     PREFETCH_FACTOR = 2       # Prefetch batches for faster loading
     PERSISTENT_WORKERS = True # Keep workers alive between epochs
     
-    SAVE_CHECKPOINT_FREQ = 10 # Save checkpoint every N epochs
+    SAVE_CHECKPOINT_FREQ = 5 # Save checkpoint every N epochs
     SAVE_SAMPLE_FREQ = 1      # Save sample images every N epochs (1 = every epoch)
     LOG_FREQ = 50             # Log training stats every N iterations
     

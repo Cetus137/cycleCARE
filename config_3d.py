@@ -15,7 +15,7 @@ class Config3D:
     USE_3D_MODEL = True   # Enable full 3D volumetric processing
     
     # ==================== Paths ====================
-    DATA_ROOT = Path("/Users/ewheeler/cycleCARE/data/")
+    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data")
     
     # 3D volume directories
     TRAIN_A_DIR = DATA_ROOT / "z100_z105_tiles"   # Clean volumes
@@ -24,7 +24,7 @@ class Config3D:
     VAL_B_DIR = DATA_ROOT / "valB"       # Validation noisy volumes
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_3d")
+    OUTPUT_ROOT = Path("./outputs_3d_SSIM")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -75,8 +75,8 @@ class Config3D:
     IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
-    SSIM_WEIGHT = 0.84        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 0.16          # Weight for L1 component (typically 0.16)
+    SSIM_WEIGHT = 0.5        # Weight for SSIM component (typically 0.84)
+    L1_WEIGHT = 0.5          # Weight for L1 component (typically 0.16)
     
     # Learning rate scheduling
     LR_DECAY_START_EPOCH = 100
