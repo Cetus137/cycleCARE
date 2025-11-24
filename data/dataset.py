@@ -13,12 +13,6 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
 
-try:
-    import tifffile
-    HAS_TIFFFILE = True
-except ImportError:
-    HAS_TIFFFILE = False
-    print("Warning: tifffile not available. Z-stack support will be limited.")
 
 
 class UnpairedMicroscopyDataset(Dataset):
