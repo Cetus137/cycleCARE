@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
-
+import tifffile
 
 
 class UnpairedMicroscopyDataset(Dataset):
@@ -308,21 +308,16 @@ class ZStackUnpairedDataset(Dataset):
             print('looking')
             for path in sorted(directory.glob(f'*{ext}')):
                 try:
-                    if HAS_TIFFFILE:
-                        # Load to check shape
-                        img = tifffile.imread(path)
-                        print(img.shape)
-                        if len(img.shape) == 3 and img.shape[0] == self.zstack_context:
-                            # Correct shape: (zstack_context, H, W)
-                            zstacks.append({'path': path})
-                        elif len(img.shape) == 2:
-                            print(f"Warning: Skipping {path.name} - single plane image (needs shape ({self.zstack_context}, H, W))")
-                        else:
-                            print(f"Warning: Skipping {path.name} - unexpected shape {img.shape} (needs ({self.zstack_context}, H, W))")
-                    else:
-                        print("Warning: tifffile not available, cannot verify shapes")
-                        # Assume files are correct format
+                    # Load to check shape
+                    img = tifffile.imread(path)
+                    print(img.shape)
+                    if len(img.shape) == 3 and img.shape[0] == self.zstack_context:
+                        # Correct shape: (zstack_context, H, W)
                         zstacks.append({'path': path})
+                    elif len(img.shape) == 2:
+                        print(f"Warning: Skipping {path.name} - single plane image (needs shape ({self.zstack_context}, H, W))")
+                    else:
+                        print(f"Warning: Skipping {path.name} - unexpected shape {img.shape} (needs ({self.zstack_context}, H, W))")
                 except Exception as e:
                     print(f"Warning: Could not read {path.name}: {e}")
         
@@ -383,11 +378,7 @@ class ZStackUnpairedDataset(Dataset):
             torch.Tensor: [zstack_context, H, W] transformed and normalized tensor
         """
         # Load the pre-stacked file
-        if HAS_TIFFFILE:
-            img_array = tifffile.imread(file_path)
-        else:
-            # Fallback to PIL (may not work for 3D arrays)
-            raise ImportError("tifffile is required for Z-stack loading. Please install: pip install tifffile")
+        img_array = tifffile.imread(file_path)
         
         # Verify shape
         if len(img_array.shape) != 3 or img_array.shape[0] != self.zstack_context:

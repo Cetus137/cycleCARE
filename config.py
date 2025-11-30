@@ -13,19 +13,19 @@ class Config:
     
     # ==================== Paths ====================
     # Data directories - use absolute paths on HPC
-    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data")
+    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data/")
     
     # Two modes supported:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT /'z100_z105_tiles'   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT /'z220_z225_tiles'   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT /'clean_combined_zstack5'   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT /'noisy_combined_zstack5'   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_grad")
+    OUTPUT_ROOT = Path("./outputs_combined_zstack5_l1")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -75,8 +75,8 @@ class Config:
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
     SSIM_WEIGHT = 0.00        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 0.25          # Weight for L1 component (typically 0.16)
-    GRAD_LOSS_WEIGHT = 5    # Weight for gradient loss (preserves edges/morphology)
+    L1_WEIGHT = 1          # Weight for L1 component (typically 0.16)
+    GRAD_LOSS_WEIGHT = 0    # Weight for gradient loss (preserves edges/morphology)
                               # Recommended: 0.5-1.0 to emphasize fine structure
                               # Set to 0.0 to disable
     
