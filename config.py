@@ -19,13 +19,13 @@ class Config:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT /'clean_combined_zstack5'   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT /'noisy_combined_zstack5'   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT /'node1_combined_zstack5_clean'   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT /'node1_combined_zstack5_noisy'   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_combined_zstack5_l1")
+    OUTPUT_ROOT = Path("./outputs_node1_CARE_l1_multiz")  # Change as needed
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -48,18 +48,18 @@ class Config:
     UNET_DEPTH = 3            # Depth of U-Net (2 for 128x128: 128→64→32, then back up)
     UNET_FILTERS = 64         # Number of filters in first layer (doubles with each layer)
     UNET_KERNEL_SIZE = 3      # Kernel size for convolutions
-    USE_DROPOUT = True        # Use dropout in U-Net
+    USE_DROPOUT = False        # Use dropout in U-Net
     DROPOUT_RATE = 0.5        # Dropout rate
     USE_BATCH_NORM = True     # Use batch normalization
     
     # Discriminator (PatchGAN)
     DISC_FILTERS = 64         # Number of filters in first discriminator layer
     DISC_NUM_LAYERS = 3       # Number of layers in discriminator
-    DISC_KERNEL_SIZE = 4      # Kernel size for discriminator
+    DISC_KERNEL_SIZE = 3      # Kernel size for discriminator
     
     # ==================== Training Parameters (HPC Optimized) ====================
     # Optimization - larger batch size for GPU
-    BATCH_SIZE = 16           # Increase for HPC GPU (V100/A100 can handle more)
+    BATCH_SIZE = 12           # Increase for HPC GPU (V100/A100 can handle more)
     NUM_EPOCHS = 200
     LEARNING_RATE = 2e-4
     BETA1 = 0.5               # Adam optimizer beta1
@@ -70,19 +70,19 @@ class Config:
     LAMBDA_IDENTITY = 5.0     # Weight for identity loss (helps preserve color)
     LAMBDA_ADV = 1.0          # Weight for adversarial loss
 
-    CYCLE_LOSS_TYPE = 'combined'     # Recommended: 'combined' or 'ssim' for denoising
+    CYCLE_LOSS_TYPE = 'l1'     # Recommended: 'combined' or 'ssim' for denoising
     IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
-    SSIM_WEIGHT = 0.00        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 1          # Weight for L1 component (typically 0.16)
-    GRAD_LOSS_WEIGHT = 0    # Weight for gradient loss (preserves edges/morphology)
+    SSIM_WEIGHT = 0.0        # Weight for SSIM component (typically 0.84)
+    L1_WEIGHT = 1.0         # Weight for L1 component (typically 0.16)
+    GRAD_LOSS_WEIGHT = 0.0    # Weight for gradient loss (preserves edges/morphology)
                               # Recommended: 0.5-1.0 to emphasize fine structure
                               # Set to 0.0 to disable
     
     # SSIM window sizes (should be smaller than your cell size)
     # For ~30 pixel cells: use window_size=7 (covers ~23% of cell)
-    SSIM_WINDOW = 7           # 2D SSIM window size (default: 7 for 128×128 images)
+    SSIM_WINDOW = 8           # 2D SSIM window size (default: 7 for 128×128 images)
     SSIM3D_WINDOW = 5         # 3D SSIM window size (default: 5 for shallow 5-plane stacks)      
     
     # Learning rate scheduling
@@ -90,7 +90,7 @@ class Config:
     LR_DECAY_END_EPOCH = 200    # Epoch to finish decaying to zero
     
     # ==================== Data Processing ====================
-    IMG_SIZE = 128            # Input image size (128x128 TIF images)
+    IMG_SIZE = 256              # Input image size (128x128 TIF images)
     
     # Percentile-based normalization for fluorescence microscopy
     # Robust to outliers like hot pixels, saturated spots, and variable background
@@ -126,8 +126,8 @@ class Config:
     LOG_FREQ = 50             # Log training stats every N iterations
     
     # Resume training
-    RESUME_TRAINING = False
-    RESUME_CHECKPOINT = None  # Path to checkpoint to resume from
+    RESUME_TRAINING = True
+    RESUME_CHECKPOINT = '/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/SLURM/outputs_node1_CARE_l1_multiz/checkpoints/checkpoint_epoch_0050.pth'  # Path to checkpoint to resume from
     
     # ==================== Inference Settings ====================
     INFERENCE_INPUT_DIR = Path("./data/test")

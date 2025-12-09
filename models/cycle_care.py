@@ -144,6 +144,20 @@ class CycleCARE(nn.Module):
             restored = self.G_BA(noisy_image)
         return restored
     
+    def degrade(self, clean_image):
+        """
+        Degrade a clean image (convenience method for inference).
+        
+        Args:
+            clean_image (torch.Tensor): Clean image from domain A
+        
+        Returns:
+            torch.Tensor: Degraded image (domain B)
+        """
+        with torch.no_grad():
+            degraded = self.G_AB(clean_image)
+        return degraded
+    
     def count_parameters(self):
         """Count the number of trainable parameters for each component."""
         return {

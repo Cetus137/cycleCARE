@@ -233,29 +233,35 @@ class SSIMLoss(nn.Module):
     def _ssim(self, img1: torch.Tensor, img2: torch.Tensor, window: torch.Tensor, 
               window_size: int, channel: int, size_average: bool = True):
         """Calculate SSIM between two images."""
-        # Constants for stability
+        # Constants for numerical stability
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
-        
+        EPS = 1e-6
+
         # Move window to same device as images
         window = window.to(img1.device)
-        
+
         # Calculate means
         mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
         mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-        
+
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
-        
-        # Calculate variances and covariance
+
+        # Calculate variances and covariance (may be slightly negative due to FP16/conv rounding)
         sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
         sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
         sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-        
-        # SSIM formula
-        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+        # Clamp tiny negative variances to zero to avoid NaNs in FP16/mixed-precision
+        sigma1_sq = torch.clamp(sigma1_sq, min=0.0)
+        sigma2_sq = torch.clamp(sigma2_sq, min=0.0)
+
+        # SSIM formula with small EPS added to denominator for stability
+        numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+        denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = numerator / (denominator + EPS)
         
         if size_average:
             return ssim_map.mean()
@@ -398,8 +404,9 @@ class MS_SSIMLoss(nn.Module):
         mssim = []
         
         for i in range(levels):
-            # Calculate SSIM at current scale
-            ssim_val = 1 - self.ssim(img1, img2)  # Note: SSIMLoss already returns 1-SSIM
+            # Calculate SSIM loss at current scale
+            # Note: SSIMLoss returns (1 - SSIM) so we can use it directly as a loss
+            ssim_val = self.ssim(img1, img2)
             mssim.append(ssim_val)
             
             # Downsample for next scale
@@ -514,32 +521,38 @@ class SSIM3DLoss(nn.Module):
     def _ssim3d(self, img1: torch.Tensor, img2: torch.Tensor, window: torch.Tensor, 
                 window_size: int, channel: int, size_average: bool = True):
         """Calculate 3D SSIM between two volumes."""
-        # Constants for stability
+        # Constants for numerical stability
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
-        
+        EPS = 1e-6
+
         # Move window to same device as images
         window = window.to(img1.device)
-        
+
         pad = window_size // 2
-        
+
         # Calculate means using 3D convolution
         mu1 = F.conv3d(img1, window, padding=pad, groups=channel)
         mu2 = F.conv3d(img2, window, padding=pad, groups=channel)
-        
+
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
-        
+
         # Calculate variances and covariance
         sigma1_sq = F.conv3d(img1 * img1, window, padding=pad, groups=channel) - mu1_sq
         sigma2_sq = F.conv3d(img2 * img2, window, padding=pad, groups=channel) - mu2_sq
         sigma12 = F.conv3d(img1 * img2, window, padding=pad, groups=channel) - mu1_mu2
-        
-        # 3D SSIM formula
-        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-        
+
+        # Clamp tiny negative variances to zero to avoid NaNs in FP16/mixed-precision
+        sigma1_sq = torch.clamp(sigma1_sq, min=0.0)
+        sigma2_sq = torch.clamp(sigma2_sq, min=0.0)
+
+        # 3D SSIM formula with small EPS added to denominator
+        numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+        denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = numerator / (denominator + EPS)
+
         if size_average:
             return ssim_map.mean()
         else:

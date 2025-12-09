@@ -87,6 +87,83 @@ def load_model(checkpoint_path, device='cuda'):
     return model, zstack_context
 
 
+def load_noise_model(checkpoint_path, device='cuda'):
+    """
+    Load the noise model (G_BA) from checkpoint by inferring architecture from weights.
+
+    This mirrors load_model but looks for G_BA keys when inferring the input channels
+    (useful if the two generators were trained with different input contexts).
+
+    Returns:
+        tuple: (model, zstack_context)
+            - model: Loaded CycleCARE model (with weights loaded)
+            - zstack_context: Number of Z-planes used (1 for single-plane, 3/5/7 for multi-plane)
+    """
+    from models import CycleCARE
+
+    # Load checkpoint
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Get state dict
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    print("Inferring noise-model (G_BA) architecture from checkpoint weights...")
+
+    # 1. Infer img_channels (Z-stack context) from first conv layer of G_BA
+    img_channels = 1
+    for key in state_dict.keys():
+        if 'G_BA.initial_conv.0.block.0.weight' in key:
+            # Shape: [out_channels, in_channels, kernel_h, kernel_w]
+            img_channels = state_dict[key].shape[1]
+            break
+
+    # 2. Infer unet_depth from encoder blocks (shared naming)
+    max_encoder_idx = -1
+    for key in state_dict.keys():
+        if 'encoder_blocks.' in key:
+            idx = int(key.split('encoder_blocks.')[1].split('.')[0])
+            max_encoder_idx = max(max_encoder_idx, idx)
+    unet_depth = max_encoder_idx + 1 if max_encoder_idx >= 0 else 2
+
+    # 3. Infer unet_filters from bottleneck
+    unet_filters = 64  # default
+    for key in state_dict.keys():
+        if 'bottleneck.0.block.0.weight' in key:
+            bottleneck_channels = state_dict[key].shape[0]
+            unet_filters = bottleneck_channels // (2 ** unet_depth)
+            break
+
+    zstack_context = img_channels
+
+    print(f"  UNET_DEPTH: {unet_depth}")
+    print(f"  UNET_FILTERS: {unet_filters}")
+    print(f"  IMG_CHANNELS: {img_channels}")
+    print(f"  ZSTACK_CONTEXT: {zstack_context}")
+
+    # Build and load model
+    model = CycleCARE(
+        img_channels=img_channels,
+        unet_depth=unet_depth,
+        unet_filters=unet_filters,
+        unet_kernel_size=3,
+        disc_filters=64,
+        disc_num_layers=3,
+        disc_kernel_size=4,
+        use_batch_norm=True,
+        use_dropout=True,
+        dropout_rate=0.5
+    ).to(device)
+
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+
+    print(f"✓ Noise model (G_BA) loaded from {checkpoint_path}")
+    return model, zstack_context
+
+
 def preprocess_image(image_array, use_percentile_norm=True, percentile_low=0.0, percentile_high=99.0, 
                      norm_min=None, norm_max=None):
     """
@@ -230,53 +307,56 @@ def postprocess_image(tensor):
 
 def tile_image(image_array, tile_size=128, overlap=16):
     """
-    Split image into overlapping tiles.
-    
+    Split image into overlapping tiles. Assumes channel-first for 3D arrays
+    (C, H, W). For 2D inputs (H, W) a singleton channel is added.
+
+    Tiles are returned in channel-first format: (C, tile_size, tile_size).
+
     Args:
-        image_array: Input image (H, W) or (H, W, C)
+        image_array: Input image (H, W) or (C, H, W)
         tile_size: Size of each tile (default 128)
         overlap: Overlap between tiles in pixels (default 16)
-    
+
     Returns:
-        tiles: List of tile arrays
-        positions: List of (y, x) positions for each tile
-        original_shape: Original image shape
+        tiles: List of tile arrays (each is (C, tile_size, tile_size) or (1, tile_size, tile_size))
+        positions: List of (y, x, y_end, x_end) positions for each tile
+        original_shape: Original spatial image shape (h, w)
     """
-    if len(image_array.shape) == 3:
-        h, w, c = image_array.shape
-    else:
+    # Normalize to channels-first layout
+    if image_array.ndim == 2:
+        # Grayscale (H, W)
         h, w = image_array.shape
+        arr_cf = image_array[np.newaxis, :, :]
         c = 1
-    
+    elif image_array.ndim == 3:
+        # Assume (C, H, W)
+        c, h, w = image_array.shape
+        arr_cf = image_array
+    else:
+        raise ValueError(f"Unsupported image_array ndim: {image_array.ndim}. Expected 2 or 3.")
+
     stride = tile_size - overlap
     tiles = []
     positions = []
-    
+
     for y in range(0, h, stride):
         for x in range(0, w, stride):
-            # Get tile boundaries
             y_end = min(y + tile_size, h)
             x_end = min(x + tile_size, w)
-            
-            # Extract tile
-            if c == 1:
-                tile = image_array[y:y_end, x:x_end]
-            else:
-                tile = image_array[y:y_end, x:x_end, :]
-            
+
+            # Extract tile in channels-first layout
+            tile = arr_cf[:, y:y_end, x:x_end]
+
             # Pad if necessary to reach tile_size
-            if tile.shape[0] < tile_size or tile.shape[1] < tile_size:
-                if c == 1:
-                    padded = np.zeros((tile_size, tile_size), dtype=image_array.dtype)
-                    padded[:tile.shape[0], :tile.shape[1]] = tile
-                else:
-                    padded = np.zeros((tile_size, tile_size, c), dtype=image_array.dtype)
-                    padded[:tile.shape[0], :tile.shape[1], :] = tile
+            tile_c, tile_h, tile_w = tile.shape
+            if tile_h < tile_size or tile_w < tile_size:
+                padded = np.zeros((tile_c, tile_size, tile_size), dtype=image_array.dtype)
+                padded[:, :tile_h, :tile_w] = tile
                 tile = padded
-            
+
             tiles.append(tile)
             positions.append((y, x, y_end, x_end))
-    
+
     return tiles, positions, (h, w)
 
 
@@ -334,7 +414,7 @@ def stitch_tiles(tiles, positions, original_shape, overlap=16):
     return output.astype(np.float32)
 
 
-def restore_image(model, image_path, output_path, device='cuda', tile_size=128, zstack_context=1, 
+def restore_image(model, image, device='cuda', tile_size=128, zstack_context=1, 
                   use_percentile_norm=True, percentile_low=1.0, percentile_high=99.0):
     """
     Restore a single image with automatic tiling for large images.
@@ -353,46 +433,21 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128, 
     Returns:
         Restored image as float32 numpy array in [0, 1] range
     """
-    print(f"\nProcessing: {image_path}")
     
-    # Load image
-    try:
-        import tifffile
-        img_array = tifffile.imread(image_path)
-    except:
-        img = Image.open(image_path)
-        img_array = np.array(img)
-    
+
     # Handle different input shapes
-    if len(img_array.shape) == 3:
+    if len(image.shape) == 3:
         # Could be (H, W, C) or (C, H, W) - TIFF Z-stacks are usually (Z, H, W)
-        if img_array.shape[0] == zstack_context and img_array.shape[0] < img_array.shape[1]:
-            # Likely (C, H, W) format from TIFF
-            c, h, w = img_array.shape
-            print(f"  Image size: {w}×{h}, {c} channels")
-        else:
-            # Likely (H, W, C) format from PIL
-            h, w, c = img_array.shape
-            if c == zstack_context:
-                # Transpose to (C, H, W) for processing
-                img_array = np.transpose(img_array, (2, 0, 1))
-                print(f"  Image size: {w}×{h}, {c} channels (transposed to C,H,W)")
-            else:
-                # Convert to grayscale if doesn't match expected channels
-                print(f"Warning: Image has {c} channels but model expects {zstack_context}, converting to grayscale")
-                img_array = np.mean(img_array, axis=2).astype(img_array.dtype)
-                h, w = img_array.shape
-                print(f"  Image size: {w}×{h}")
-    else:
-        h, w = img_array.shape
-        print(f"  Image size: {w}×{h}")
+        if image.shape[0] == zstack_context:
+            C, Y, X = image.shape
+            print(f"  Image size: {X}×{Y}, {C} channels")
     
     # Check if tiling is needed
-    if h <= tile_size and w <= tile_size:
+    if Y <= tile_size and X <= tile_size:
         print(f"  Using direct processing (image ≤ {tile_size}×{tile_size})")
         
         # Preprocess with percentile normalization
-        tensor = preprocess_image(img_array, use_percentile_norm=use_percentile_norm, 
+        tensor = preprocess_image(image, use_percentile_norm=use_percentile_norm, 
                                  percentile_low=percentile_low, percentile_high=percentile_high)
         
         # Handle Z-stack context: replicate single channel if needed
@@ -416,7 +471,7 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128, 
         print(f"  Using tiled processing ({tile_size}×{tile_size} tiles with 16px overlap)")
         
         # Tile the image
-        tiles, positions, original_shape = tile_image(img_array, tile_size=tile_size, overlap=16)
+        tiles, positions, original_shape = tile_image(image, tile_size=tile_size, overlap=16)
         print(f"  Created {len(tiles)} tiles")
         
         # Process each tile
@@ -441,28 +496,118 @@ def restore_image(model, image_path, output_path, device='cuda', tile_size=128, 
         # Stitch tiles back together
         print("  Stitching tiles...")
         restored = stitch_tiles(restored_tiles, positions, original_shape, overlap=16)
-    
-    # Save result
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save as float32 TIFF (preserves full precision) or convert to uint8/uint16 for other formats
-    if output_path.suffix.lower() in ['.tif', '.tiff']:
-        if tifffile is not None:
-            tifffile.imwrite(output_path, restored)
-        else:
-            # Fallback: convert to uint16 for PIL
-            restored_uint16 = (restored * 65535).astype(np.uint16)
-            Image.fromarray(restored_uint16).save(output_path)
-    else:
-        # For PNG, JPG etc: convert to uint8
-        restored_uint8 = (restored * 255).astype(np.uint8)
-        Image.fromarray(restored_uint8).save(output_path)
-    
-    print(f"  ✓ Saved to: {output_path}")
-    
     return restored  # Return float32 array
 
+def degrade_image(model, image, device='cuda', tile_size=128, zstack_context=1,
+                  use_percentile_norm=True, percentile_low=1.0, percentile_high=99.0,
+                  normalization_type='global'):
+    """
+    Restore a single image with automatic tiling for large images.
+    
+    Args:
+        model: Trained CycleCARE model
+        image_path: Path to input noisy image
+        output_path: Path to save restored image (TIFF preserves float32, PNG/JPG converts to uint8)
+        device: Device to use ('cuda' or 'cpu')
+        tile_size: Tile size (default 128 to match training)
+        zstack_context: Number of channels model expects (1 for single-plane, 5 for Z-stack)
+        use_percentile_norm: Use percentile-based normalization (recommended for fluorescence)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+    
+    Returns:
+        Restored image as float32 numpy array in [0, 1] range
+    """
+    
+
+    # Normalize input layout: assume channel-first for 3D (C, H, W)
+    if image.ndim == 2:
+        C = 1
+        Y, X = image.shape
+        image_cf = image[np.newaxis, :, :]
+    elif image.ndim == 3:
+        C, Y, X = image.shape
+        image_cf = image
+    else:
+        raise ValueError(f"Unsupported image ndim: {image.ndim}")
+
+    print(f"  Image size: {X}×{Y}, {C} channels")
+
+    # Compute global normalization params if requested
+    global_norm = None
+    if normalization_type == 'global':
+        # compute over entire image (all channels)
+        params = compute_normalization_params(image_cf, use_percentile_norm=use_percentile_norm,
+                                             percentile_low=percentile_low, percentile_high=percentile_high)
+        global_p_min = params['p_min']
+        global_p_max = params['p_max']
+        global_norm = (global_p_min, global_p_max)
+    
+    # Check if tiling is needed
+    if Y <= tile_size and X <= tile_size:
+        print(f"  Using direct processing (image ≤ {tile_size}×{tile_size})")
+
+        # Preprocess with percentile normalization (global or per-tile)
+        if global_norm is not None:
+            tensor = preprocess_image(image_cf, norm_min=global_p_min, norm_max=global_p_max)
+        else:
+            tensor = preprocess_image(image_cf, use_percentile_norm=use_percentile_norm,
+                                     percentile_low=percentile_low, percentile_high=percentile_high)
+
+        # Handle Z-stack context: replicate single channel if needed
+        if tensor.shape[0] == 1 and zstack_context > 1:
+            # Single channel but model expects multi-channel - replicate
+            tensor = tensor.repeat(zstack_context, 1, 1)
+            print(f"  Replicated single channel to {zstack_context} channels for Z-stack model")
+        elif tensor.shape[0] != zstack_context:
+            print(f"  Warning: Tensor has {tensor.shape[0]} channels but model expects {zstack_context}")
+
+        tensor = tensor.unsqueeze(0).to(device)  # Add batch dimension
+
+        # Degrade (model.forward)
+        with torch.no_grad():
+            restored_tensor = model.degrade(tensor)
+
+        # Postprocess
+        degraded = postprocess_image(restored_tensor[0])
+
+    else:
+        print(f"  Using tiled processing ({tile_size}×{tile_size} tiles with 16px overlap)")
+
+        # Tile the image
+        tiles, positions, original_shape = tile_image(image_cf, tile_size=tile_size, overlap=16)
+        print(f"  Created {len(tiles)} tiles")
+
+        # Process each tile
+        degraded_tiles = []
+        for i, tile in enumerate(tiles):
+            if (i + 1) % 100 == 0:
+                print(f"    Preparing tile {i+1}/{len(tiles)}")
+
+            # Preprocess with percentile normalization (global or per-tile)
+            if global_norm is not None:
+                tensor = preprocess_image(tile, norm_min=global_p_min, norm_max=global_p_max)
+            else:
+                tensor = preprocess_image(tile, use_percentile_norm=use_percentile_norm,
+                                         percentile_low=percentile_low, percentile_high=percentile_high)
+            tensor = tensor.unsqueeze(0).to(device)
+
+            # Degrade
+            with torch.no_grad():
+                restored_tensor = model.degrade(tensor)
+
+            # Postprocess
+            degraded_tile = postprocess_image(restored_tensor[0])
+            degraded_tiles.append(degraded_tile)
+
+            if (i + 1) % 10 == 0:
+                print(f"    Processed {i + 1}/{len(tiles)} tiles")
+
+        # Stitch tiles back together
+        print("  Stitching tiles...")
+        degraded = stitch_tiles(degraded_tiles, positions, original_shape, overlap=16)
+
+    return degraded  # Return float32 array
 
 def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, overlap=16):
     """
@@ -738,49 +883,6 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
     return restored_zstack
 
 
-def denoise_single_image(checkpoint_path, input_path, output_path, device='cuda', tile_size=128,
-                         use_percentile_norm=True, percentile_low=1.0, percentile_high=99.0):
-    """
-    Denoise a single 2D image.
-    
-    Args:
-        checkpoint_path: Path to model checkpoint
-        input_path: Path to input noisy image
-        output_path: Path to save restored image (use .tif/.tiff to preserve float32 precision)
-        device: Device to use ('cuda' or 'cpu')
-        tile_size: Tile size for large images (default 128)
-        use_percentile_norm: Use percentile-based normalization (recommended for fluorescence, default True)
-        percentile_low: Lower percentile for normalization (default 1.0)
-        percentile_high: Upper percentile for normalization (default 99.0)
-    
-    Returns:
-        Restored image as float32 numpy array in [0, 1] range
-    
-    Example:
-        img = denoise_single_image(
-            checkpoint_path='outputs/checkpoints/best_model.pth',
-            input_path='noisy_image.tif',
-            output_path='restored_image.tif'  # Use .tif for float32
-        )
-    """
-    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    model, zstack_context = load_model(checkpoint_path, device=device)
-    
-    # Warn if model expects Z-stack but single image provided
-    if zstack_context > 1:
-        print(f"⚠️  Model was trained with {zstack_context}-plane Z-stack context.")
-        print(f"   For single 2D images, output may be suboptimal.")
-        print(f"   Consider using denoise_zstack() for best results.")
-    
-    restored = restore_image(model, input_path, output_path, device=device, tile_size=tile_size, 
-                            zstack_context=zstack_context, use_percentile_norm=use_percentile_norm, 
-                            percentile_low=percentile_low, percentile_high=percentile_high)
-    
-    print("✓ Done!")
-    return restored
-
 
 def denoise_zstack(model, zstack, zstack_context=1, device='cuda', tile_size=128, 
                    percentile_low=0.0, percentile_high=99.0, normalization_type='global',
@@ -989,44 +1091,217 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
     print(f"✓ Saved restored timelapse stack to {output_path}")
     return restored
 
+
+def denoise_batch_zstacks(checkpoint_path, input_dir, output_dir, device='cuda', tile_size=128, 
+                        percentile_low=1.0, percentile_high=99.0, normalization_type='global',
+                        sliding_window_size=20, pattern='*.tif'):
+    """
+    Denoise all Z-stacks in a directory.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        input_dir: Directory containing input Z-stack files
+        output_dir: Directory to save restored Z-stacks
+        device: Device to use ('cuda' or 'cpu')
+        tile_size: Tile size for large images (default 128)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+        normalization_type: Type of normalization ('global', 'per_plane', or 'sliding_window', default 'global')
+        sliding_window_size: Window size for sliding window normalization (default 20)
+        pattern: File pattern to match (default '*.tif')
+    
+    Example:
+        denoise_batch_zstacks(
+            checkpoint_path='outputs/checkpoints/best_model.pth',
+            input_dir='zstack_noisy/',
+            output_dir='zstack_restored/',
+            pattern='*.tif'
+        )
+    """
+    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find all matching files
+    files = sorted(input_dir.glob(pattern))
+    if len(files) == 0:
+        print(f"No files matching '{pattern}' found in {input_dir}")
+        return
+    
+    print(f"Found {len(files)} Z-stack file(s) to process")
+    
+    # Load model once
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    
+    # Process each file
+    for i, input_path in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] Processing: {input_path.name}")
+        output_path = output_dir / f"{input_path.stem}_restored{input_path.suffix}"
+        
+        try:
+            # Load Z-stack
+            zstack = tifffile.imread(str(input_path))
+            
+            restored_zstack = restore_zstack(
+                model, zstack, device=device, tile_size=tile_size,
+                zstack_context=zstack_context,
+                percentile_low=percentile_low,
+                percentile_high=percentile_high,
+                normalization_type=normalization_type,
+                sliding_window_size=sliding_window_size
+            )
+            # Save restored Z-stack
+            tifffile.imwrite(str(output_path), restored_zstack)
+            print(f"✓ Saved restored Z-stack to {output_path}")
+        except Exception as e:
+            print(f"Error processing {input_path.name}: {e}")
+
+
+
+def addnoise_batch_zstacks(checkpoint_path, input_dir, output_dir, device='cuda', tile_size=128, 
+                        percentile_low=1.0, percentile_high=99.0,
+                        sliding_window_size=20, pattern='*.tif'):
+    """
+    Add noise to all Z-stacks in a directory.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        input_dir: Directory containing input Z-stack files
+        output_dir: Directory to save restored Z-stacks
+        device: Device to use ('cuda' or 'cpu')
+        tile_size: Tile size for large images (default 128)
+        percentile_low: Lower percentile for normalization (default 1.0)
+        percentile_high: Upper percentile for normalization (default 99.0)
+        normalization_type: Type of normalization ('global', 'per_plane', or 'sliding_window', default 'global')
+        sliding_window_size: Window size for sliding window normalization (default 20)
+        pattern: File pattern to match (default '*.tif')
+    
+    Example:
+        addnoise_batch_zstacks(
+            checkpoint_path='outputs/checkpoints/best_model.pth',
+            input_dir='zstack_noisy/',
+            output_dir='zstack_restored/',
+            pattern='*.tif'
+        )
+    """
+    device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find all matching files
+    files = sorted(input_dir.glob(pattern))
+    print('files found are :', files)
+    if len(files) == 0:
+        print(f"No files matching '{pattern}' found in {input_dir}")
+        return
+    
+    print(f"Found {len(files)} Z-stack file(s) to process")
+    
+    # Load model once
+    model, zstack_context = load_model(checkpoint_path, device=device)
+    
+    # Process each file
+    for i, input_path in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] Processing: {input_path.name}")
+        output_path = output_dir / f"{input_path.stem}_noisy{input_path.suffix}"
+        zstack = tifffile.imread(str(input_path))
+        
+        degraded_zstack = degrade_image(model=model, 
+                                        image=zstack, 
+                                        device=device,
+                                        tile_size=tile_size,
+                                        zstack_context=zstack_context,
+                                        use_percentile_norm=True,
+                                        percentile_low=percentile_low,
+                                        percentile_high=percentile_high,
+        )
+
+
+        # Save degraded Z-stack
+        tifffile.imwrite(str(output_path), degraded_zstack)
+        print(f"✓ Saved degraded Z-stack to {output_path}")
+
+
 if __name__ == "__main__":
 
 
     import argparse
-    # Set up command-line argument parser
-    parser = argparse.ArgumentParser(
-        description='Tiled 3D dsnoising (with 3 views) for large timelapses',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-                Examples:
-                # Segment all timepoints with default settings
-                python simple_inference.py --video video.tif --output results/ --model /path/to/model
-                        '''
-                    )
-    
-    parser.add_argument('--checkpoint_path', type=str, help='Path to input checkpoint')
-    parser.add_argument('--input_path'     , type=str, help='Path to input timelapse video (TIFF)')
-    parser.add_argument('--output_path'    , type=str, help='Output path for results')
-    parser.add_argument('--t_range'        , nargs=2, type=int, metavar=('START', 'END'),
-                       help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
-    parser.add_argument('--three_views'    , default=False,
-                       help='whether to use three views denoising', action='store_true')
-    parser.add_argument('--normalization_type', type=str, default='global',
-                       help="Normalization type: 'global', 'per_plane', or 'sliding_window'")
-    
-    args = parser.parse_args()
-    
-    # Check if running with command-line arguments or using example code
-    if args.input_path and args.output_path and args.checkpoint_path:
-        # Command-line mode
-        print("Running in command-line mode...")
-        
-        denoise_timelapse_stack(
-            checkpoint_path   = args.checkpoint_path,
-            input_path        = args.input_path,
-            output_path       = args.output_path,
-            t_range           = args.t_range,
-            three_views       = args.three_views,
-            normalization_type= args.normalization_type
-        )
 
+    timelapse = True
+    batch = False
+
+    if timelapse:
+        # Set up command-line argument parser
+        parser = argparse.ArgumentParser(
+            description='Tiled 3D dsnoising (with 3 views) for large timelapses',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog='''
+                    Examples:
+                    # Segment all timepoints with default settings
+                    python simple_inference.py --video video.tif --output results/ --model /path/to/model
+                            '''
+                        )
+        
+        parser.add_argument('--checkpoint_path', type=str, help='Path to input checkpoint')
+        parser.add_argument('--input_path'     , type=str, help='Path to input timelapse video (TIFF)')
+        parser.add_argument('--output_path'    , type=str, help='Output path for results')
+        parser.add_argument('--t_range'        , nargs=2, type=int, metavar=('START', 'END'),
+                        help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
+        parser.add_argument('--three_views'    , default=False,
+                        help='whether to use three views denoising', action='store_true')
+        parser.add_argument('--normalization_type', type=str, default='global',
+                        help="Normalization type: 'global', 'per_plane', or 'sliding_window'")
+        
+        args = parser.parse_args()
+        
+        # Check if running with command-line arguments or using example code
+        if args.input_path and args.output_path and args.checkpoint_path:
+            # Command-line mode
+            print("Running in command-line mode...")
+            
+            denoise_timelapse_stack(
+                checkpoint_path   = args.checkpoint_path,
+                input_path        = args.input_path,
+                output_path       = args.output_path,
+                t_range           = args.t_range,
+                three_views       = args.three_views,
+                normalization_type= args.normalization_type
+            )
+
+    elif batch:
+        # Set up command-line argument parser
+        parser = argparse.ArgumentParser(
+            description='Batch denoising for multiple Z-stacks in a directory',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog='''
+                    Examples:
+                    # Denoise all Z-stacks in input_dir and save to output_dir
+                    python simple_inference.py --input_dir zstacks_noisy/ --output_dir zstacks_restored/ --model /path/to/model
+                            '''
+                        )
+        
+        parser.add_argument('--checkpoint_path', type=str, help='Path to input checkpoint')
+        parser.add_argument('--input_dir'      , type=str, help='Directory with input Z-stacks (TIFF files)')
+        parser.add_argument('--output_dir'     , type=str, help='Output directory for restored Z-stacks')
+        parser.add_argument('--pattern'        , type=str, default='*.tif', help='File pattern to match (default: *.tif)')
+
+        
+        args = parser.parse_args()
+        
+        # Check if running with command-line arguments or using example code
+        if args.input_dir and args.output_dir and args.checkpoint_path:
+            # Command-line mode
+            print("Running in command-line mode...")
+            
+            addnoise_batch_zstacks(
+                checkpoint_path   = args.checkpoint_path,
+                input_dir         = args.input_dir,
+                output_dir        = args.output_dir,
+                pattern           = args.pattern,
+            )   
