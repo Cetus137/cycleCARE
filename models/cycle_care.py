@@ -32,14 +32,19 @@ class CycleCARE(nn.Module):
         disc_filters (int): Base number of filters in discriminators
         disc_num_layers (int): Number of layers in discriminators
         disc_kernel_size (int): Kernel size for discriminator convolutions
+        disc_channels (int): Number of input channels for discriminators (default: same as img_channels)
         use_batch_norm (bool): Whether to use batch normalization
         use_dropout (bool): Whether to use dropout in generators
         dropout_rate (float): Dropout probability
     """
     def __init__(self, img_channels=1, unet_depth=3, unet_filters=64, unet_kernel_size=3,
-                 disc_filters=64, disc_num_layers=3, disc_kernel_size=4,
+                 disc_filters=64, disc_num_layers=3, disc_kernel_size=4, disc_channels=None,
                  use_batch_norm=True, use_dropout=True, dropout_rate=0.5):
         super(CycleCARE, self).__init__()
+        
+        # Default disc_channels to img_channels if not specified
+        if disc_channels is None:
+            disc_channels = img_channels
         
         # Generators
         self.G_AB = CAREUNet(
@@ -66,7 +71,7 @@ class CycleCARE(nn.Module):
         
         # Discriminators
         self.D_A = PatchGANDiscriminator(
-            in_channels=img_channels,
+            in_channels=disc_channels,
             base_filters=disc_filters,
             num_layers=disc_num_layers,
             kernel_size=disc_kernel_size,
@@ -74,7 +79,7 @@ class CycleCARE(nn.Module):
         )
         
         self.D_B = PatchGANDiscriminator(
-            in_channels=img_channels,
+            in_channels=disc_channels,
             base_filters=disc_filters,
             num_layers=disc_num_layers,
             kernel_size=disc_kernel_size,

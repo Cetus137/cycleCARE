@@ -6,6 +6,8 @@ Includes adversarial, cycle-consistency, and identity losses.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.transforms import GaussianBlur
+from torchvision.transforms import GaussianBlur
 from typing import Optional
 
 
@@ -720,6 +722,10 @@ class CycleCarelosses:
         self.lambda_identity = config.LAMBDA_IDENTITY
         self.lambda_adv = config.LAMBDA_ADV
         
+        # Discriminator input mode for noise-focused training
+        self.disc_input_mode = getattr(config, 'DISC_INPUT_MODE', 'raw')
+        self.disc_highpass_sigma = getattr(config, 'DISC_HIGHPASS_SIGMA', 1.0)
+        
         # Print loss configuration
         print(f"Loss configuration:")
         print(f"  Cycle loss type: {cycle_loss_type}")
@@ -727,6 +733,19 @@ class CycleCarelosses:
         if cycle_loss_type == 'combined':
             print(f"  SSIM weight: {ssim_weight}, L1 weight: {l1_weight}, Grad weight: {grad_weight}")
         print(f"  Lambda values: cycle={self.lambda_cycle}, identity={self.lambda_identity}, adv={self.lambda_adv}")
+        mode_str = self.disc_input_mode if isinstance(self.disc_input_mode, str) else ' + '.join(self.disc_input_mode)
+        print(f"  Discriminator input mode: {mode_str}")
+        mode_check = self.disc_input_mode if isinstance(self.disc_input_mode, str) else self.disc_input_mode
+        if isinstance(mode_check, str):
+            has_highpass = 'highpass' in mode_check
+            has_fft = 'fft' in mode_check
+        else:
+            has_highpass = 'highpass' in mode_check
+            has_fft = 'fft' in mode_check
+        if has_highpass:
+            print(f"  High-pass sigma: {self.disc_highpass_sigma}")
+        if has_fft:
+            print(f"  FFT magnitude: enabled (log-scaled)")
     
     def compute_generator_loss(self, model, real_A, real_B, D_A, D_B):
         """
@@ -754,11 +773,13 @@ class CycleCarelosses:
         
         # Adversarial loss
         # G_BA should fool D_A
-        pred_fake_A = D_A(fake_A)
+        fake_A_disc = self._preprocess_discriminator_input(fake_A)
+        pred_fake_A = D_A(fake_A_disc)
         loss_G_BA = self.gan_loss(pred_fake_A, True) * self.lambda_adv
         
         # G_AB should fool D_B
-        pred_fake_B = D_B(fake_B)
+        fake_B_disc = self._preprocess_discriminator_input(fake_B)
+        pred_fake_B = D_B(fake_B_disc)
         loss_G_AB = self.gan_loss(pred_fake_B, True) * self.lambda_adv
         
         # Cycle-consistency loss
@@ -786,6 +807,94 @@ class CycleCarelosses:
         
         return total_loss, loss_dict
     
+    def _apply_highpass_filter(self, x):
+        """
+        Apply high-pass filter to emphasize noise features.
+        
+        Args:
+            x (torch.Tensor): Input image tensor (B, C, H, W)
+        
+        Returns:
+            torch.Tensor: High-pass filtered image
+        """
+        # Create Gaussian blur dynamically with appropriate kernel size
+        # kernel_size should be odd and roughly 4*sigma + 1
+        kernel_size = int(4 * self.disc_highpass_sigma + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        # Apply Gaussian blur
+        blur = GaussianBlur(kernel_size=kernel_size, sigma=self.disc_highpass_sigma)
+        x_blur = blur(x)
+        
+        # High-pass = original - blurred (emphasizes noise and fine details)
+        x_hp = x - x_blur
+        
+        return x_hp
+    
+    def _apply_fft_transform(self, x):
+        """
+        Apply FFT magnitude transform to emphasize frequency characteristics.
+        
+        Args:
+            x (torch.Tensor): Input image tensor (B, C, H, W)
+        
+        Returns:
+            torch.Tensor: FFT magnitude spectrum (log-scaled)
+        """
+        # 2D FFT per channel
+        fft = torch.fft.fft2(x, dim=(-2, -1))
+        
+        # Shift zero frequency to center
+        fft_shifted = torch.fft.fftshift(fft, dim=(-2, -1))
+        
+        # Magnitude spectrum (log scale for better dynamic range)
+        fft_mag = torch.abs(fft_shifted)
+        fft_log = torch.log(fft_mag + 1e-8)  # Add epsilon to avoid log(0)
+        
+        return fft_log
+    
+    def _preprocess_discriminator_input(self, x):
+        """
+        Preprocess input for discriminator based on configured mode.
+        
+        Supports combinations: ['raw'], ['highpass'], ['fft'], or any combination.
+        Examples: ['raw'], ['highpass'], ['fft'], ['raw', 'highpass'], 
+                  ['raw', 'fft'], ['highpass', 'fft'], ['raw', 'highpass', 'fft']
+        
+        Args:
+            x (torch.Tensor): Input image tensor (B, C, H, W)
+        
+        Returns:
+            torch.Tensor: Preprocessed input
+        """
+        # Convert string mode to list for backward compatibility
+        if isinstance(self.disc_input_mode, str):
+            # Handle legacy string format like 'raw_plus_highpass'
+            mode_list = self.disc_input_mode.split('_plus_')
+        else:
+            mode_list = self.disc_input_mode
+        
+        # Collect all requested representations
+        representations = []
+        
+        for mode in mode_list:
+            if mode == 'raw':
+                representations.append(x)
+            elif mode == 'highpass':
+                representations.append(self._apply_highpass_filter(x))
+            elif mode == 'fft':
+                representations.append(self._apply_fft_transform(x))
+            else:
+                raise ValueError(f"Unknown mode component: {mode} in {self.disc_input_mode}")
+        
+        # If only one representation, return it directly
+        if len(representations) == 1:
+            return representations[0]
+        
+        # Otherwise concatenate along channel dimension
+        return torch.cat(representations, dim=1)
+    
     def compute_discriminator_loss(self, D, real, fake):
         """
         Compute discriminator loss for a single discriminator.
@@ -798,12 +907,16 @@ class CycleCarelosses:
         Returns:
             tuple: (loss, loss_dict)
         """
+        # Preprocess inputs based on configured mode (e.g., high-pass filtering)
+        real_input = self._preprocess_discriminator_input(real)
+        fake_input = self._preprocess_discriminator_input(fake.detach())
+        
         # Real loss
-        pred_real = D(real)
+        pred_real = D(real_input)
         loss_real = self.gan_loss(pred_real, True)
         
         # Fake loss
-        pred_fake = D(fake.detach())
+        pred_fake = D(fake_input)
         loss_fake = self.gan_loss(pred_fake, False)
         
         # Total discriminator loss

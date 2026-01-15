@@ -667,7 +667,6 @@ def _denoise_with_tiling_and_context(stacked_input, model, device, tile_size, ov
                     restored_tensor = restored_tensor.squeeze(2)  # [1, 1, H, W]
             else:
                 # 2D model: use restore method
-                print('using 2D model...')
                 restored_tensor = model.restore(tile_batch)
         
         restored_tile = postprocess_image(restored_tensor[0])
@@ -869,7 +868,7 @@ def restore_zstack(model, zstack, device='cuda', tile_size=128, zstack_context=1
             
             restored_plane = postprocess_image(restored_tensor[0])
         else:
-            print('using tiling for large image...')
+            #ng for large image...')
             # Tiled processing with context
             # Need to tile all context planes together
             restored_plane = _denoise_with_tiling_and_context(
@@ -924,7 +923,7 @@ def denoise_zstack(model, zstack, zstack_context=1, device='cuda', tile_size=128
     return restored
 
 
-def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128, three_views=False, t_range=None,
+def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cuda', tile_size=128, three_views=False, t_list=None,
                            percentile_low=0.0, percentile_high=99.0, normalization_type='global',
                            sliding_window_size=20):
     
@@ -942,6 +941,7 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
         output_path: Path to output restored stack (same dimensionality)
         device: 'cuda' or 'cpu'
         tile_size: Tile size for large XY images
+        t_list: List of specific timepoint indices to process (default None processes all timepoints)
         percentile_low: Lower percentile for normalization (default 1.0)
         percentile_high: Upper percentile for normalization (default 99.0)
         normalization_type: Type of normalization ('global', 'per_plane', or 'sliding_window', default 'global')
@@ -950,12 +950,6 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
     Returns:
         Restored stack as float32 numpy array with same shape as input.
     """
-    # Prepare t_range parameter
-    if t_range is not None:
-        t_range = tuple(args.t_range)
-        print(f"Processing timepoint range: {t_range[0]} to {t_range[1]}")
-    else:
-        print("Processing all timepoints")
 
     device = device if device == 'cpu' or torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
@@ -967,12 +961,12 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
     output_path = Path(output_path)  # if not already a Path
     output_dir = output_path.parent if not output_path.is_dir() else output_path
 
-    # Load the image stack
-    arr = tifffile.imread(str(input_path))
+    # Load the image stack using memory mapping for efficient lazy loading
+    # Only loads metadata initially; timepoints loaded on-demand when accessed
+    arr = tifffile.memmap(str(input_path), mode='r')
     orig_shape = arr.shape
-    print(f"Loaded stack shape: {orig_shape}")
-    #please convert the input array to float32 for processing
-    arr = arr.astype(np.float32)
+    print(f"Loaded stack shape: {orig_shape} (memory-mapped)")
+    # Note: float32 conversion happens per-timepoint below to avoid loading entire stack
 
     # Normalize dimensionality
     if arr.ndim == 5:  # (T,C,Z,Y,X)
@@ -992,26 +986,17 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
 
 
     # Determine which timepoints to process
-    print(t_range)
-    if t_range is None:
+    if t_list is None:
         # Process all timepoints
         timepoints_to_process = list(range(n_timepoints))
-    elif isinstance(t_range, (list, np.ndarray)):
-        print('list detected')
+        print(f"Processing all {n_timepoints} timepoints")
+    else:
         # Process specific timepoints from list
-        timepoints_to_process = list(t_range)
+        timepoints_to_process = list(t_list)
         # Validate indices
         if any(t < 0 or t >= n_timepoints for t in timepoints_to_process):
-            raise ValueError(f"t_range contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
-    elif isinstance(t_range, tuple) and len(t_range) == 2:
-        print('tuple detected')
-        # Process range of timepoints
-        start, end = t_range
-        if start < 0 or end > n_timepoints:
-            raise ValueError(f"t_range ({start}, {end}) out of bounds. Valid range: 0-{n_timepoints}")
-        timepoints_to_process = list(range(start, end))
-    else:
-        raise ValueError("t_range must be None, a list of indices, or a tuple (start, end)")
+            raise ValueError(f"t_list contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
+        print(f"Processing {len(timepoints_to_process)} specific timepoints: {timepoints_to_process}")
 
     # Process each timepoint
     print("Beginning timelapse denoising...")
@@ -1022,7 +1007,7 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
 
         for idx, t in enumerate(timepoints_to_process):
             print(f"Processing timepoint {t} ({idx+1}/{len(timepoints_to_process)})")
-            zstack = arr[t]  # (Z, Y, X)
+            zstack = arr[t].astype(np.float32)  # (Z, Y, X) - load and convert this timepoint only
             restored_zstack  = denoise_zstack(model=model,
                                                 zstack=zstack,
                                                 device=device,
@@ -1075,20 +1060,27 @@ def denoise_timelapse_stack(checkpoint_path, input_path, output_path, device='cu
                                                 percentile_low=percentile_low,
                                                 percentile_high=percentile_high,
                                                 normalization_type=normalization_type,
-                                                sliding_window_size=sliding_window_size)
+                                            sliding_window_size=sliding_window_size)
             restored[0,idx,...] = restored_xy
             restored[1,idx,...] = np.transpose(restored_xz, (1,0,2))
             restored[2,idx,...] = np.transpose(restored_yz, (1,2,0))
+            
             outfile = output_dir / f'restored_timepoint_{t:04d}.tif'
             tifffile.imwrite(outfile, restored[:,idx,...])
             print(f"✓ Saved restored timepoint {t} of shape {restored[:,idx,...].shape} to {outfile}")
+    
+    if T_range >1:
+        # Save full restored stack if multiple timepoints processed
+        outfile = output_dir / f'restored_timelapse_stack.tif' 
+        tifffile.imwrite(str(outfile), restored)
+        print(f"✓ Saved restored timelapse stack to {outfile}")
 
     # Save output preserving shape
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(output_path), restored)
+    #output_path = Path(output_path)
+    #output_path.parent.mkdir(parents=True, exist_ok=True)
+    #tifffile.imwrite(str(output_path), restored)
 
-    print(f"✓ Saved restored timelapse stack to {output_path}")
+
     return restored
 
 
@@ -1142,8 +1134,8 @@ def denoise_batch_zstacks(checkpoint_path, input_dir, output_dir, device='cuda',
         output_path = output_dir / f"{input_path.stem}_restored{input_path.suffix}"
         
         try:
-            # Load Z-stack
-            zstack = tifffile.imread(str(input_path))
+            # Load Z-stack using memory mapping for efficiency
+            zstack = tifffile.memmap(str(input_path), mode='r')[:]  # [:] loads into memory
             
             restored_zstack = restore_zstack(
                 model, zstack, device=device, tile_size=tile_size,
@@ -1210,7 +1202,7 @@ def addnoise_batch_zstacks(checkpoint_path, input_dir, output_dir, device='cuda'
     for i, input_path in enumerate(files, 1):
         print(f"\n[{i}/{len(files)}] Processing: {input_path.name}")
         output_path = output_dir / f"{input_path.stem}_noisy{input_path.suffix}"
-        zstack = tifffile.imread(str(input_path))
+        zstack = tifffile.memmap(str(input_path), mode='r')[:]  # Load into memory
         
         degraded_zstack = degrade_image(model=model, 
                                         image=zstack, 
@@ -1251,8 +1243,8 @@ if __name__ == "__main__":
         parser.add_argument('--checkpoint_path', type=str, help='Path to input checkpoint')
         parser.add_argument('--input_path'     , type=str, help='Path to input timelapse video (TIFF)')
         parser.add_argument('--output_path'    , type=str, help='Output path for results')
-        parser.add_argument('--t_range'        , nargs=2, type=int, metavar=('START', 'END'),
-                        help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
+        parser.add_argument('--t_list', nargs='+', type=int, metavar='T', default=None,
+                       help='Specific timepoints to process. If not provided, all timepoints will be processed. E.g., --t_list 0 5 10 15')
         parser.add_argument('--three_views'    , default=False,
                         help='whether to use three views denoising', action='store_true')
         parser.add_argument('--normalization_type', type=str, default='global',
@@ -1269,7 +1261,7 @@ if __name__ == "__main__":
                 checkpoint_path   = args.checkpoint_path,
                 input_path        = args.input_path,
                 output_path       = args.output_path,
-                t_range           = args.t_range,
+                t_list            = args.t_list,
                 three_views       = args.three_views,
                 normalization_type= args.normalization_type
             )

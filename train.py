@@ -10,6 +10,10 @@ import torch.nn as nn
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for HPC
+import matplotlib.pyplot as plt
+import numpy as np
 
 from config import Config
 from models import CycleCARE
@@ -75,6 +79,7 @@ def setup_training(config):
         disc_filters=config.DISC_FILTERS,
         disc_num_layers=config.DISC_NUM_LAYERS,
         disc_kernel_size=config.DISC_KERNEL_SIZE,
+        disc_channels=config.DISC_CHANNELS,
         use_batch_norm=config.USE_BATCH_NORM,
         use_dropout=config.USE_DROPOUT,
         dropout_rate=config.DROPOUT_RATE
@@ -106,13 +111,13 @@ def setup_training(config):
     
     optimizer_D_A = torch.optim.Adam(
         model_ref.D_A.parameters(),
-        lr=config.LEARNING_RATE,
+        lr=config.LEARNING_RATE_D,
         betas=(config.BETA1, config.BETA2)
     )
     
     optimizer_D_B = torch.optim.Adam(
         model_ref.D_B.parameters(),
-        lr=config.LEARNING_RATE,
+        lr=config.LEARNING_RATE_D,
         betas=(config.BETA1, config.BETA2)
     )
     
@@ -296,6 +301,164 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
     return {key: meter.avg for key, meter in meters.items()}
 
 
+def plot_losses(loss_history, epoch, config):
+    """
+    Plot loss curves and save to disk (replaces previous plot).
+    
+    Args:
+        loss_history: Dictionary with keys 'train' and 'val', each containing
+                     dictionaries of loss lists (e.g., {'G_total': [...], ...})
+        epoch (int): Current epoch number
+        config: Configuration object
+    """
+    # Create figure with subplots
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle(f'Training Progress - Epoch {epoch}/{config.NUM_EPOCHS}', fontsize=16, fontweight='bold')
+    
+    epochs = list(range(1, epoch + 1))
+    
+    # Plot 1: Total Generator Loss
+    ax = axes[0, 0]
+    if 'G_total' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['G_total'], 'b-', linewidth=2, label='Train')
+    ax.set_title('Total Generator Loss', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 2: Generator Adversarial Losses
+    ax = axes[0, 1]
+    if 'G_AB' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['G_AB'], 'g-', linewidth=2, label='G_AB (Clean→Noisy)')
+    if 'G_BA' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['G_BA'], 'm-', linewidth=2, label='G_BA (Noisy→Clean)')
+    ax.set_title('Generator Adversarial Losses', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 3: Cycle Consistency Losses
+    ax = axes[0, 2]
+    if 'cycle_A' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['cycle_A'], 'c-', linewidth=2, label='Cycle A (Clean→Noisy→Clean)')
+    if 'cycle_B' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['cycle_B'], 'orange', linewidth=2, label='Cycle B (Noisy→Clean→Noisy)')
+    if 'cycle_A' in loss_history['val']:
+        ax.plot(epochs, loss_history['val']['cycle_A'], 'c--', linewidth=2, alpha=0.7, label='Val Cycle A')
+    if 'cycle_B' in loss_history['val']:
+        ax.plot(epochs, loss_history['val']['cycle_B'], 'orange', linewidth=2, linestyle='--', alpha=0.7, label='Val Cycle B')
+    ax.set_title('Cycle Consistency Losses', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 4: Identity Losses
+    ax = axes[1, 0]
+    if 'identity_A' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['identity_A'], 'r-', linewidth=2, label='Identity A (Clean)')
+    if 'identity_B' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['identity_B'], 'purple', linewidth=2, label='Identity B (Noisy)')
+    ax.set_title('Identity Preservation Losses', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 5: Discriminator Losses
+    ax = axes[1, 1]
+    if 'D_A' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['D_A'], 'brown', linewidth=2, label='D_A (Clean domain)')
+    if 'D_B' in loss_history['train']:
+        ax.plot(epochs, loss_history['train']['D_B'], 'olive', linewidth=2, label='D_B (Noisy domain)')
+    ax.set_title('Discriminator Losses', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 6: Loss Ratios (for balance analysis)
+    ax = axes[1, 2]
+    if all(k in loss_history['train'] for k in ['cycle_B', 'G_BA', 'D_B']):
+        cycle_ratio = [c / (g + 1e-8) for c, g in zip(loss_history['train']['cycle_B'], loss_history['train']['G_BA'])]
+        disc_ratio = [d / (g + 1e-8) for d, g in zip(loss_history['train']['D_B'], loss_history['train']['G_BA'])]
+        ax.plot(epochs, cycle_ratio, 'b-', linewidth=2, label='Cycle/Adv Ratio')
+        ax.plot(epochs, disc_ratio, 'r-', linewidth=2, label='Disc/Gen Ratio')
+        ax.axhline(y=1.0, color='k', linestyle='--', alpha=0.5, label='Balanced (1.0)')
+    ax.set_title('Loss Component Ratios', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Ratio')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 7: Recent trends (last 20% of epochs or last 20 epochs, whichever is smaller)
+    ax = axes[2, 0]
+    window = min(20, max(1, epoch // 5))
+    recent_epochs = epochs[-window:]
+    if 'G_total' in loss_history['train'] and len(recent_epochs) > 1:
+        ax.plot(recent_epochs, loss_history['train']['G_total'][-window:], 'b-', linewidth=2, marker='o', label='G_total')
+    if 'cycle_B' in loss_history['train'] and len(recent_epochs) > 1:
+        ax.plot(recent_epochs, loss_history['train']['cycle_B'][-window:], 'orange', linewidth=2, marker='s', label='Cycle B')
+    ax.set_title(f'Recent Trends (Last {window} Epochs)', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 8: Validation Cycle Losses (zoomed)
+    ax = axes[2, 1]
+    if 'cycle_B' in loss_history['val']:
+        ax.plot(epochs, loss_history['val']['cycle_B'], 'orange', linewidth=2, marker='o', markersize=3, label='Val Cycle B (Restoration)')
+    if 'cycle_A' in loss_history['val']:
+        ax.plot(epochs, loss_history['val']['cycle_A'], 'c', linewidth=2, marker='s', markersize=3, label='Val Cycle A')
+    ax.set_title('Validation Performance', fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 9: Loss statistics table
+    ax = axes[2, 2]
+    ax.axis('off')
+    
+    # Calculate statistics for current epoch
+    stats_text = f"""CURRENT EPOCH STATISTICS (Epoch {epoch})\n
+    {'="' * 30}\n
+    """
+    if epoch > 0:
+        train_losses = {k: v[-1] if v else 0 for k, v in loss_history['train'].items()}
+        val_losses = {k: v[-1] if v else 0 for k, v in loss_history['val'].items()}
+        
+        stats_text += f"Generator Total: {train_losses.get('G_total', 0):.4f}\n"
+        stats_text += f"  - G_AB (Adv):  {train_losses.get('G_AB', 0):.4f}\n"
+        stats_text += f"  - G_BA (Adv):  {train_losses.get('G_BA', 0):.4f}\n"
+        stats_text += f"  - Cycle A:     {train_losses.get('cycle_A', 0):.4f}\n"
+        stats_text += f"  - Cycle B:     {train_losses.get('cycle_B', 0):.4f}\n"
+        stats_text += f"  - Identity A:  {train_losses.get('identity_A', 0):.4f}\n"
+        stats_text += f"  - Identity B:  {train_losses.get('identity_B', 0):.4f}\n\n"
+        stats_text += f"Discriminators:\n"
+        stats_text += f"  - D_A:         {train_losses.get('D_A', 0):.4f}\n"
+        stats_text += f"  - D_B:         {train_losses.get('D_B', 0):.4f}\n\n"
+        stats_text += f"Validation:\n"
+        stats_text += f"  - Cycle A:     {val_losses.get('cycle_A', 0):.4f}\n"
+        stats_text += f"  - Cycle B:     {val_losses.get('cycle_B', 0):.4f}\n"
+    
+    ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, 
+            fontsize=10, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    plt.tight_layout()
+    
+    # Save figure (replaces previous)
+    save_path = config.SAMPLE_DIR / 'loss_curves.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"Saved loss curves to {save_path}")
+
+
 def validate(model, val_loader, loss_manager, epoch, config, writer=None):
     """
     Validate the model.
@@ -398,6 +561,19 @@ def train(config):
         writer = SummaryWriter(log_dir)
         print(f"\nTensorBoard logs will be saved to {log_dir}")
     
+    # Initialize loss history tracking
+    loss_history = {
+        'train': {
+            'G_total': [], 'G_AB': [], 'G_BA': [],
+            'cycle_A': [], 'cycle_B': [],
+            'identity_A': [], 'identity_B': [],
+            'D_A': [], 'D_B': []
+        },
+        'val': {
+            'cycle_A': [], 'cycle_B': []
+        }
+    }
+    
     # Resume training if specified
     start_epoch = 1
     best_val_loss = float('inf')
@@ -413,6 +589,12 @@ def train(config):
         )
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        
+        # Restore loss history if available
+        if 'loss_history' in checkpoint:
+            loss_history = checkpoint['loss_history']
+            print(f"Restored loss history from checkpoint")
+        
         print(f"Resumed from epoch {start_epoch-1}")
     
     # Training loop
@@ -445,6 +627,17 @@ def train(config):
         # Validate
         val_losses = validate(model, val_loader, loss_manager, epoch, config, writer)
         
+        # Update loss history
+        for key in loss_history['train'].keys():
+            if key in train_losses:
+                loss_history['train'][key].append(train_losses[key])
+        for key in loss_history['val'].keys():
+            if key in val_losses:
+                loss_history['val'][key].append(val_losses[key])
+        
+        # Plot loss curves (replaces previous plot)
+        plot_losses(loss_history, epoch, config)
+        
         # Save checkpoint
         if epoch % config.SAVE_CHECKPOINT_FREQ == 0:
             # Handle DataParallel for state dict
@@ -460,6 +653,7 @@ def train(config):
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
+                'loss_history': loss_history,  # Save loss history
                 'config': config_to_dict(config)  # Save as dict for proper serialization
             }, checkpoint_path)
         
@@ -480,6 +674,7 @@ def train(config):
                 'optimizer_D_B_state_dict': optimizers['D_B'].state_dict(),
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
+                'loss_history': loss_history,  # Save loss history to best model too
                 'config': config_to_dict(config)  # Save as dict for proper serialization
             }, best_model_path)
             print(f"✓ New best model saved! (val cycle_B loss: {best_val_loss:.4f})")

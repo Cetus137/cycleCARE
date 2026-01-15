@@ -19,13 +19,13 @@ class Config:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT /'node1_combined_zstack5_clean'   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT /'node1_combined_zstack5_noisy'   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT /'clean_combined_zstack5'   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT /'noisy_combined_zstack5'   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_node1_CARE_l1_multiz")  # Change as needed
+    OUTPUT_ROOT = Path("./outputs_bothnodes_CARE_unet3_D1e4_full")  # Change as needed
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -39,13 +39,13 @@ class Config:
     # Generator (CARE-style U-Net)
     
     # Z-stack context settings
-    ZSTACK_CONTEXT = 5        # Number of adjacent Z-planes to use as input (1 = single plane, 3/5/7 = multi-plane)
-    ZSTACK_MODE = True       # Enable Z-stack context mode (uses multi-plane input)
+    ZSTACK_CONTEXT = 1           # Number of adjacent Z-planes to use as input (1 = single plane, 3/5/7 = multi-plane)
+    ZSTACK_MODE    = False       # Enable Z-stack context mode (uses multi-plane input)
     
     # IMG_CHANNELS automatically set based on ZSTACK_CONTEXT if ZSTACK_MODE is True
     IMG_CHANNELS = ZSTACK_CONTEXT if ZSTACK_MODE else 1  # Input channels (1 for single plane, N for Z-context)
     
-    UNET_DEPTH = 3            # Depth of U-Net (2 for 128x128: 128→64→32, then back up)
+    UNET_DEPTH = 3            # Depth of U-Net (3 for 128x128: 128→64→32→16, ~30M params, 3x faster than depth=4)
     UNET_FILTERS = 64         # Number of filters in first layer (doubles with each layer)
     UNET_KERNEL_SIZE = 3      # Kernel size for convolutions
     USE_DROPOUT = False        # Use dropout in U-Net
@@ -54,43 +54,60 @@ class Config:
     
     # Discriminator (PatchGAN)
     DISC_FILTERS = 64         # Number of filters in first discriminator layer
-    DISC_NUM_LAYERS = 3       # Number of layers in discriminator
+    DISC_NUM_LAYERS = 3       # Number of layers in discriminator (3 to match generator depth)
     DISC_KERNEL_SIZE = 3      # Kernel size for discriminator
+    
+    # Discriminator input mode - focus on noise features
+    # Provide list of representations to concatenate. Options: 'raw', 'highpass', 'fft'
+    # Examples:
+    #   ['raw'] - original images only
+    #   ['highpass'] - high-pass filtered only (emphasizes spatial noise)
+    #   ['fft'] - FFT magnitude spectrum only (emphasizes frequency characteristics)
+    #   ['raw', 'highpass'] - both raw and high-pass (2x channels)
+    #   ['highpass', 'fft'] - high-pass and FFT (2x channels)
+    #   ['raw', 'highpass', 'fft'] - all three (3x channels)
+    DISC_INPUT_MODE = ['raw']  # Current: high-pass filtering only
+    DISC_HIGHPASS_SIGMA = 1.0      # Gaussian blur sigma for high-pass filter (1.0-2.0 recommended)
+    
+    # Discriminator input channels (automatically adjusted based on DISC_INPUT_MODE)
+    DISC_CHANNELS = IMG_CHANNELS * len(DISC_INPUT_MODE)
     
     # ==================== Training Parameters (HPC Optimized) ====================
     # Optimization - larger batch size for GPU
-    BATCH_SIZE = 12           # Increase for HPC GPU (V100/A100 can handle more)
-    NUM_EPOCHS = 200
-    LEARNING_RATE = 2e-4
+    BATCH_SIZE = 32           # Optimized for 128x128 images with 5-plane Z-stack (HPC GPU can handle more)
+    NUM_EPOCHS = 50
+    LEARNING_RATE = 2e-4      # Generator learning rate
+    LEARNING_RATE_D = 1e-4    # Discriminator learning rate (half of generator to slow down discriminator)
     BETA1 = 0.5               # Adam optimizer beta1
     BETA2 = 0.999             # Adam optimizer beta2
     
     # Loss weights
-    LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss
-    LAMBDA_IDENTITY = 5.0     # Weight for identity loss (helps preserve color)
-    LAMBDA_ADV = 1.0          # Weight for adversarial loss
+    LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss (increased for stronger denoising)
+    LAMBDA_IDENTITY = 0.5     # Weight for identity loss (reduced to focus more on cycle consistency)
+    LAMBDA_ADV = 5.0          # Weight for adversarial loss (increased to prevent discriminator overpowering)
 
-    CYCLE_LOSS_TYPE = 'l1'     # Recommended: 'combined' or 'ssim' for denoising
+    CYCLE_LOSS_TYPE = 'combined'     # Recommended: 'combined' or 'ssim' for denoising
     IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
     
     # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
-    SSIM_WEIGHT = 0.0        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 1.0         # Weight for L1 component (typically 0.16)
-    GRAD_LOSS_WEIGHT = 0.0    # Weight for gradient loss (preserves edges/morphology)
-                              # Recommended: 0.5-1.0 to emphasize fine structure
-                              # Set to 0.0 to disable
+    # Balanced combination: SSIM for perceptual quality + L1 for pixel accuracy + Gradient for edges
+    SSIM_WEIGHT = 0.7        # Weight for SSIM component (perceptual similarity, structure preservation)
+    L1_WEIGHT = 0.2          # Weight for L1 component (pixel-level accuracy)
+    GRAD_LOSS_WEIGHT = 0.1   # Weight for gradient loss (edge/morphology preservation)
+                              # Total weights sum to 1.0 for balanced contribution
     
     # SSIM window sizes (should be smaller than your cell size)
     # For ~30 pixel cells: use window_size=7 (covers ~23% of cell)
-    SSIM_WINDOW = 8           # 2D SSIM window size (default: 7 for 128×128 images)
+    # Must be odd numbers for SSIM
+    SSIM_WINDOW = 7           # 2D SSIM window size (optimized for 128×128 images)
     SSIM3D_WINDOW = 5         # 3D SSIM window size (default: 5 for shallow 5-plane stacks)      
     
     # Learning rate scheduling
-    LR_DECAY_START_EPOCH = 100  # Epoch to start decaying learning rate
-    LR_DECAY_END_EPOCH = 200    # Epoch to finish decaying to zero
+    LR_DECAY_START_EPOCH = 25  # Epoch to start decaying learning rate
+    LR_DECAY_END_EPOCH = 50    # Epoch to finish decaying to zero
     
     # ==================== Data Processing ====================
-    IMG_SIZE = 256              # Input image size (128x128 TIF images)
+    IMG_SIZE = 128              # Input image size (128x128 TIF images)
     
     # Percentile-based normalization for fluorescence microscopy
     # Robust to outliers like hot pixels, saturated spots, and variable background
@@ -126,8 +143,8 @@ class Config:
     LOG_FREQ = 50             # Log training stats every N iterations
     
     # Resume training
-    RESUME_TRAINING = True
-    RESUME_CHECKPOINT = '/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/SLURM/outputs_node1_CARE_l1_multiz/checkpoints/checkpoint_epoch_0050.pth'  # Path to checkpoint to resume from
+    RESUME_TRAINING = False
+    RESUME_CHECKPOINT = None #r'/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/SLURM/outputs_node1_CARE_C10_I1_A10_raw_highpass_long_multiz/checkpoints/checkpoint_epoch_0050.pth' #'/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/SLURM/outputs_node1_CARE_plane_C10_I1_A5/checkpoints/checkpoint_epoch_0030.pth'  # Path to checkpoint to resume from
     
     # ==================== Inference Settings ====================
     INFERENCE_INPUT_DIR = Path("./data/test")

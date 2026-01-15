@@ -305,12 +305,10 @@ class ZStackUnpairedDataset(Dataset):
         
         # Look for TIFF files with correct shape
         for ext in extensions:
-            print('looking')
             for path in sorted(directory.glob(f'*{ext}')):
                 try:
                     # Load to check shape
                     img = tifffile.imread(path)
-                    print(img.shape)
                     if len(img.shape) == 3 and img.shape[0] == self.zstack_context:
                         # Correct shape: (zstack_context, H, W)
                         zstacks.append({'path': path})
