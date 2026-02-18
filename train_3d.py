@@ -339,7 +339,7 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
         set_requires_grad([model_ref.D_A, model_ref.D_B], False)  # Freeze discriminators
         optimizers['G'].zero_grad()
         
-        # Mixed precision forward pass
+        # Mixed precision forward pass - also caches fake_A, fake_B for discriminator reuse
         if config.MIXED_PRECISION:
             with autocast():
                 loss_G, loss_dict_G = loss_manager.compute_generator_loss(
@@ -355,60 +355,56 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
             loss_G.backward()
             optimizers['G'].step()
         
-        # ===================== Train Discriminator A =====================
-        set_requires_grad(model_ref.D_A, True)  # Unfreeze discriminator A
-        optimizers['D_A'].zero_grad()
-        
-        # Generate fake A and get from pool
+        # Generate fakes ONCE for both discriminators (reused below via image pools)
         with torch.no_grad():
             if config.MIXED_PRECISION:
                 with autocast():
                     fake_A = model_ref.G_BA(real_B)
+                    fake_B = model_ref.G_AB(real_A)
             else:
                 fake_A = model_ref.G_BA(real_B)
-        fake_A_pooled = image_pools['A'].query(fake_A)
+                fake_B = model_ref.G_AB(real_A)
         
-        # Compute discriminator A loss
+        # Query image pools (for training stability via historical fakes)
+        fake_A_pooled = image_pools['A'].query(fake_A)
+        fake_B_pooled = image_pools['B'].query(fake_B)
+        
+        # ===================== Train Discriminator A =====================
+        set_requires_grad(model_ref.D_A, True)
+        set_requires_grad(model_ref.D_B, False)
+        optimizers['D_A'].zero_grad()
+        
         if config.MIXED_PRECISION:
             with autocast():
-                loss_D_A, _, loss_dict_D = loss_manager.compute_discriminator_losses(
-                    model, real_A, real_B, model_ref.D_A, model_ref.D_B
+                loss_D_A, _, loss_dict_D = loss_manager.compute_discriminator_losses_from_fakes(
+                    real_A, real_B, fake_A_pooled, fake_B_pooled, model_ref.D_A, model_ref.D_B
                 )
             scaler.scale(loss_D_A).backward()
             scaler.step(optimizers['D_A'])
             scaler.update()
         else:
-            loss_D_A, _, loss_dict_D = loss_manager.compute_discriminator_losses(
-                model, real_A, real_B, model_ref.D_A, model_ref.D_B
+            loss_D_A, _, loss_dict_D = loss_manager.compute_discriminator_losses_from_fakes(
+                real_A, real_B, fake_A_pooled, fake_B_pooled, model_ref.D_A, model_ref.D_B
             )
             loss_D_A.backward()
             optimizers['D_A'].step()
         
         # ===================== Train Discriminator B =====================
-        set_requires_grad(model_ref.D_B, True)  # Unfreeze discriminator B
+        set_requires_grad(model_ref.D_A, False)
+        set_requires_grad(model_ref.D_B, True)
         optimizers['D_B'].zero_grad()
         
-        # Generate fake B and get from pool
-        with torch.no_grad():
-            if config.MIXED_PRECISION:
-                with autocast():
-                    fake_B = model_ref.G_AB(real_A)
-            else:
-                fake_B = model_ref.G_AB(real_A)
-        fake_B_pooled = image_pools['B'].query(fake_B)
-        
-        # Compute discriminator B loss
         if config.MIXED_PRECISION:
             with autocast():
-                _, loss_D_B, _ = loss_manager.compute_discriminator_losses(
-                    model, real_A, real_B, model_ref.D_A, model_ref.D_B
+                _, loss_D_B, _ = loss_manager.compute_discriminator_losses_from_fakes(
+                    real_A, real_B, fake_A_pooled, fake_B_pooled, model_ref.D_A, model_ref.D_B
                 )
             scaler.scale(loss_D_B).backward()
             scaler.step(optimizers['D_B'])
             scaler.update()
         else:
-            _, loss_D_B, _ = loss_manager.compute_discriminator_losses(
-                model, real_A, real_B, model_ref.D_A, model_ref.D_B
+            _, loss_D_B, _ = loss_manager.compute_discriminator_losses_from_fakes(
+                real_A, real_B, fake_A_pooled, fake_B_pooled, model_ref.D_A, model_ref.D_B
             )
             loss_D_B.backward()
             optimizers['D_B'].step()

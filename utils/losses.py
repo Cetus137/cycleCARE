@@ -949,6 +949,26 @@ class CycleCarelosses:
             fake_A = model.G_BA(real_B)
             fake_B = model.G_AB(real_A)
         
+        return self.compute_discriminator_losses_from_fakes(
+            real_A, real_B, fake_A, fake_B, D_A, D_B
+        )
+
+    def compute_discriminator_losses_from_fakes(self, real_A, real_B, fake_A, fake_B, D_A, D_B):
+        """
+        Compute losses for both discriminators using pre-computed fake images.
+        Avoids redundant generator forward passes when fakes are already available.
+        
+        Args:
+            real_A (torch.Tensor): Real images from domain A
+            real_B (torch.Tensor): Real images from domain B
+            fake_A (torch.Tensor): Pre-computed fake domain A images (detached)
+            fake_B (torch.Tensor): Pre-computed fake domain B images (detached)
+            D_A: Discriminator for domain A
+            D_B: Discriminator for domain B
+        
+        Returns:
+            tuple: (loss_D_A, loss_D_B, loss_dict)
+        """
         # Discriminator A loss
         loss_D_A, dict_D_A = self.compute_discriminator_loss(D_A, real_A, fake_A)
         
