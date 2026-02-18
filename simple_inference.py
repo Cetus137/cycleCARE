@@ -59,12 +59,21 @@ def load_model(checkpoint_path, device='cuda'):
             unet_filters = bottleneck_channels // (2 ** unet_depth)
             break
     
+    # 4. Infer disc_kernel_size from discriminator weights
+    disc_kernel_size = 4  # default
+    for key in state_dict.keys():
+        if 'D_A.model.0.weight' in key or 'D_B.model.0.weight' in key:
+            # Shape: [out_channels, in_channels, kernel_h, kernel_w]
+            disc_kernel_size = state_dict[key].shape[2]  # or shape[3], should be same
+            break
+    
     zstack_context = img_channels
     
     print(f"  UNET_DEPTH: {unet_depth}")
     print(f"  UNET_FILTERS: {unet_filters}")
     print(f"  IMG_CHANNELS: {img_channels}")
     print(f"  ZSTACK_CONTEXT: {zstack_context}")
+    print(f"  DISC_KERNEL_SIZE: {disc_kernel_size}")
     
     # Build and load model
     model = CycleCARE(
@@ -74,7 +83,7 @@ def load_model(checkpoint_path, device='cuda'):
         unet_kernel_size=3,
         disc_filters=64,
         disc_num_layers=3,
-        disc_kernel_size=4,
+        disc_kernel_size=disc_kernel_size,
         use_batch_norm=True,
         use_dropout=True,
         dropout_rate=0.5
@@ -127,13 +136,12 @@ def load_noise_model(checkpoint_path, device='cuda'):
             idx = int(key.split('encoder_blocks.')[1].split('.')[0])
             max_encoder_idx = max(max_encoder_idx, idx)
     unet_depth = max_encoder_idx + 1 if max_encoder_idx >= 0 else 2
-
-    # 3. Infer unet_filters from bottleneck
-    unet_filters = 64  # default
+# 4. Infer disc_kernel_size from discriminator weights
+    disc_kernel_size = 4  # default
     for key in state_dict.keys():
-        if 'bottleneck.0.block.0.weight' in key:
-            bottleneck_channels = state_dict[key].shape[0]
-            unet_filters = bottleneck_channels // (2 ** unet_depth)
+        if 'D_A.model.0.weight' in key or 'D_B.model.0.weight' in key:
+            # Shape: [out_channels, in_channels, kernel_h, kernel_w]
+            disc_kernel_size = state_dict[key].shape[2]  # or shape[3], should be same
             break
 
     zstack_context = img_channels
@@ -142,6 +150,7 @@ def load_noise_model(checkpoint_path, device='cuda'):
     print(f"  UNET_FILTERS: {unet_filters}")
     print(f"  IMG_CHANNELS: {img_channels}")
     print(f"  ZSTACK_CONTEXT: {zstack_context}")
+    print(f"  DISC_KERNEL_SIZE: {disc_kernel_size}")
 
     # Build and load model
     model = CycleCARE(
@@ -151,7 +160,7 @@ def load_noise_model(checkpoint_path, device='cuda'):
         unet_kernel_size=3,
         disc_filters=64,
         disc_num_layers=3,
-        disc_kernel_size=4,
+        disc_kernel_size=disc_kernel_size,
         use_batch_norm=True,
         use_dropout=True,
         dropout_rate=0.5

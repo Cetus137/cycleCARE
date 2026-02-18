@@ -19,13 +19,13 @@ class Config:
     # 1. PRE-SPLIT: Use separate train/val directories (set AUTO_SPLIT_DATA=False)
     # 2. AUTO-SPLIT: Single directory, automatic split (set AUTO_SPLIT_DATA=True)
     
-    TRAIN_A_DIR = DATA_ROOT /'clean_combined_zstack5'   # Clean surface microscopy images
-    TRAIN_B_DIR = DATA_ROOT /'noisy_combined_zstack5'   # Noisy microscopy images to restore
+    TRAIN_A_DIR = DATA_ROOT /'node2_z85_z89_256'   # Clean surface microscopy images
+    TRAIN_B_DIR = DATA_ROOT /'node2_z205_z209_256'   # Noisy microscopy images to restore
     VAL_A_DIR = DATA_ROOT / "valA"      # Validation clean images (only for pre-split)
     VAL_B_DIR = DATA_ROOT / "valB"      # Validation noisy images (only for pre-split)
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_bothnodes_CARE_unet3_D1e4_full")  # Change as needed
+    OUTPUT_ROOT = Path("./outputs_node2_CARE_unet3_D2e5_256_")  # Change as needed
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -39,13 +39,13 @@ class Config:
     # Generator (CARE-style U-Net)
     
     # Z-stack context settings
-    ZSTACK_CONTEXT = 1           # Number of adjacent Z-planes to use as input (1 = single plane, 3/5/7 = multi-plane)
-    ZSTACK_MODE    = False       # Enable Z-stack context mode (uses multi-plane input)
+    ZSTACK_CONTEXT = 5           # Number of adjacent Z-planes to use as input (1 = single plane, 3/5/7 = multi-plane)
+    ZSTACK_MODE    = True      # Enable Z-stack context mode (uses multi-plane input)
     
     # IMG_CHANNELS automatically set based on ZSTACK_CONTEXT if ZSTACK_MODE is True
     IMG_CHANNELS = ZSTACK_CONTEXT if ZSTACK_MODE else 1  # Input channels (1 for single plane, N for Z-context)
     
-    UNET_DEPTH = 3            # Depth of U-Net (3 for 128x128: 128→64→32→16, ~30M params, 3x faster than depth=4)
+    UNET_DEPTH = 3            # Depth of U-Net (3 for 128x128: 128→64→32→16, fewer parameters, faster than depth=4)
     UNET_FILTERS = 64         # Number of filters in first layer (doubles with each layer)
     UNET_KERNEL_SIZE = 3      # Kernel size for convolutions
     USE_DROPOUT = False        # Use dropout in U-Net
@@ -54,7 +54,7 @@ class Config:
     
     # Discriminator (PatchGAN)
     DISC_FILTERS = 64         # Number of filters in first discriminator layer
-    DISC_NUM_LAYERS = 3       # Number of layers in discriminator (3 to match generator depth)
+    DISC_NUM_LAYERS = 3       # Number of layers in discriminator (4 to match generator depth)
     DISC_KERNEL_SIZE = 3      # Kernel size for discriminator
     
     # Discriminator input mode - focus on noise features
@@ -74,15 +74,15 @@ class Config:
     
     # ==================== Training Parameters (HPC Optimized) ====================
     # Optimization - larger batch size for GPU
-    BATCH_SIZE = 32           # Optimized for 128x128 images with 5-plane Z-stack (HPC GPU can handle more)
+    BATCH_SIZE = 16           # Optimized for 128x128 images with 5-plane Z-stack (HPC GPU can handle more)
     NUM_EPOCHS = 50
     LEARNING_RATE = 2e-4      # Generator learning rate
-    LEARNING_RATE_D = 1e-4    # Discriminator learning rate (half of generator to slow down discriminator)
+    LEARNING_RATE_D = 2e-5    # Discriminator learning rate (half of generator to slow down discriminator)
     BETA1 = 0.5               # Adam optimizer beta1
     BETA2 = 0.999             # Adam optimizer beta2
     
     # Loss weights
-    LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss (increased for stronger denoising)
+    LAMBDA_CYCLE = 15.0       # Weight for cycle-consistency loss (increased for stronger denoising)
     LAMBDA_IDENTITY = 0.5     # Weight for identity loss (reduced to focus more on cycle consistency)
     LAMBDA_ADV = 5.0          # Weight for adversarial loss (increased to prevent discriminator overpowering)
 
@@ -107,7 +107,7 @@ class Config:
     LR_DECAY_END_EPOCH = 50    # Epoch to finish decaying to zero
     
     # ==================== Data Processing ====================
-    IMG_SIZE = 128              # Input image size (128x128 TIF images)
+    IMG_SIZE = 256              # Input image size (128x128 TIF images)
     
     # Percentile-based normalization for fluorescence microscopy
     # Robust to outliers like hot pixels, saturated spots, and variable background
