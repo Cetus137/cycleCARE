@@ -15,16 +15,16 @@ class Config3D:
     USE_3D_MODEL = True   # Enable full 3D volumetric processing
     
     # ==================== Paths ====================
-    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data")
+    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data_3D")
     
     # 3D volume directories
-    TRAIN_A_DIR = DATA_ROOT / "z100_z105_tiles"   # Clean volumes
-    TRAIN_B_DIR = DATA_ROOT / "z220_z225_tiles"   # Noisy volumes
-    VAL_A_DIR = DATA_ROOT / "valA"       # Validation clean volumes
-    VAL_B_DIR = DATA_ROOT / "valB"       # Validation noisy volumes
+    TRAIN_A_DIR = DATA_ROOT / "surface"     # Clean surface volumes (Z=0-64)
+    TRAIN_B_DIR = DATA_ROOT / "deep"        # Degraded deep volumes (Z=64-128)
+    VAL_A_DIR = DATA_ROOT / "valA"                        # Validation clean surface volumes
+    VAL_B_DIR = DATA_ROOT / "valB"                        # Validation degraded deep volumes
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_3d_SSIM")
+    OUTPUT_ROOT = Path("./outputs_3d_subset_long_A100")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -34,56 +34,63 @@ class Config3D:
     for dir_path in [CHECKPOINT_DIR, LOG_DIR, SAMPLE_DIR, INFERENCE_DIR]:
         dir_path.mkdir(parents=True, exist_ok=True)
     
-    # ==================== 3D Model Architecture ====================
+    # ==================== 3D Model Architecture (64×64×64 Volumes) ====================
     # Generator (CARE-style 3D U-Net)
     IMG_CHANNELS = 1          # Input channels (1 for grayscale microscopy)
-    VOLUME_DEPTH = 5          # Number of Z-planes in training volumes (MUST match your data!)
-    IMG_HEIGHT = 128          # Height of training volumes
-    IMG_WIDTH = 128           # Width of training volumes
+    VOLUME_DEPTH = 64         # Number of Z-planes (MUST match your data!)
+    IMG_HEIGHT = 128          # Height of volumes (64×128×128 tiles)
+    IMG_WIDTH = 128           # Width of volumes (64×128×128 tiles)
     
-    UNET_DEPTH = 2            # Depth of 3D U-Net (reduced for shallow volumes)
-    UNET_FILTERS = 32         # Base filters (reduced from 64 due to memory)
+    # Network architecture - deeper network enabled by larger dimensions
+    UNET_DEPTH = 3            # Depth of 3D U-Net (64×128×128 → 32×64×64 → 16×32×32 → 8×16×16)
+    UNET_FILTERS = 24         # Base filters (reduced to 24 for memory efficiency with 64×128×128 volumes)
     UNET_KERNEL_SIZE = 3      # Kernel size for 3D convolutions
-    USE_DROPOUT = True        # Use dropout in 3D U-Net
+    USE_DROPOUT = True        # Use dropout in 3D U-Net (important for depth generalization)
     DROPOUT_RATE = 0.5        # Dropout rate
     USE_BATCH_NORM = True     # Use batch normalization
     
     # Discriminator (3D PatchGAN)
-    DISC_FILTERS = 32         # Base filters (reduced from 64 due to memory)
-    DISC_NUM_LAYERS = 2       # Number of layers in 3D discriminator (reduced for shallow volumes)
-    DISC_KERNEL_SIZE = 3      # Kernel size for 3D discriminator (reduced from 4 for shallow volumes)
+    DISC_FILTERS = 24         # Base filters (matched to generator)
+    DISC_NUM_LAYERS = 3       # Number of layers in 3D discriminator (increased for 64³)
+    DISC_KERNEL_SIZE = 4      # Kernel size for 3D discriminator
     
-    # ==================== Training Parameters (3D Optimized) ====================
-    # CRITICAL: 3D models require MUCH smaller batch sizes
-    BATCH_SIZE = 1            # Likely max 1-2 for 3D on most GPUs
-    NUM_EPOCHS = 200
-    LEARNING_RATE = 2e-4
+    # ==================== Training Parameters (64³ Optimized) ====================
+    # CRITICAL: 64³ volumes are ~3× larger than 5×128×128, requires batch_size=1
+    BATCH_SIZE = 2            # Maximum for 64³ volumes on most GPUs
+    NUM_EPOCHS = 50          # More epochs for depth degradation learning
+    LEARNING_RATE = 2e-4      # Standard learning rate
+    LEARNING_RATE_D = 2e-4    # Discriminator learning rate (balanced for depth features)
     BETA1 = 0.5
     BETA2 = 0.999
     
-    # Loss weights
-    LAMBDA_CYCLE = 10.0       # Weight for cycle-consistency loss
-    LAMBDA_IDENTITY = 5.0     # Weight for identity loss
-    LAMBDA_ADV = 1.0          # Weight for adversarial loss
+    # Loss weights - optimized for depth-dependent restoration
+    LAMBDA_CYCLE = 20.0       # High cycle consistency to preserve depth coherence
+    LAMBDA_IDENTITY = 0.5     # Lower identity to allow stronger restoration
+    LAMBDA_ADV = 5.0          # Balanced adversarial weight
     
-    # Loss types - choose from: 'l1', 'l2', 'ssim', 'combined'
+    # Loss types - optimized for depth restoration
     # - 'l1': Mean Absolute Error (pixel-wise, sharp but can be blocky)
     # - 'l2': Mean Squared Error (pixel-wise, sensitive to outliers, can blur)
     # - 'ssim': Structural Similarity (perceptual, preserves texture/structure)
-    # - 'combined': SSIM + L1 (best of both: structure + pixel accuracy)
-    CYCLE_LOSS_TYPE = 'combined'     # Recommended: 'combined' or 'ssim' for denoising
-    IDENTITY_LOSS_TYPE = 'l1'        # Usually L1 is fine for identity
+    # - 'combined': 3D SSIM + L1 + Gradient (best for depth-dependent features)
+    CYCLE_LOSS_TYPE = 'combined'     # Combined loss preserves 3D structure across depth
+    IDENTITY_LOSS_TYPE = 'l1'        # L1 for identity
     
-    # Weights for combined loss (only used if CYCLE_LOSS_TYPE='combined')
-    SSIM_WEIGHT = 0.5        # Weight for SSIM component (typically 0.84)
-    L1_WEIGHT = 0.5          # Weight for L1 component (typically 0.16)
+    # Weights for combined loss - balanced for depth coherence
+    SSIM_WEIGHT = 0.2        # High SSIM to preserve 3D structural similarity across depth
+    L1_WEIGHT = 0.7          # Moderate L1 for pixel accuracy
+    GRAD_LOSS_WEIGHT = 0.1   # Gradient loss to preserve edges/features across depth
+    
+    # SSIM window sizes for 3D
+    SSIM_WINDOW = 7          # 2D SSIM window (if used)
+    SSIM3D_WINDOW = 7        # 3D SSIM window size (smaller than default 11 for 64³)
     
     # Learning rate scheduling
-    LR_DECAY_START_EPOCH = 100
-    LR_DECAY_END_EPOCH = 200
+    LR_DECAY_START_EPOCH = 25
+    LR_DECAY_END_EPOCH = 50
     
-    # ==================== 3D Data Processing ====================
-    USE_RANDOM_CROP = False    # Use random 3D crops (more efficient than resizing)
+    # ==================== 3D Data Processing (64×128×128 Volumes) ====================
+    USE_RANDOM_CROP = False    # Volumes are already preprocessed to 64×128×128, no cropping needed
     
     # Percentile-based normalization for fluorescence microscopy
     USE_PERCENTILE_NORM = True
@@ -99,45 +106,45 @@ class Config3D:
     CLIP_MAX = None
     
     # Data splitting
-    AUTO_SPLIT_DATA = True   # Use pre-split directories for 3D
+    AUTO_SPLIT_DATA = True   # Automatically split training data for validation
     VAL_SPLIT_RATIO = 0.2
     
-    # 3D augmentation
-    USE_RANDOM_FLIP = False    # Random flips in all 3 axes
-    USE_RANDOM_ROTATION = False  # Random 90° rotations (expensive in 3D)
+    # 3D augmentation - important for generalization across depth patterns
+    USE_RANDOM_FLIP = True     # Random flips in all 3 axes (helps learn depth invariance)
+    USE_RANDOM_ROTATION = False  # Random 90° rotations (expensive, disable for speed)
     
-    # ==================== HPC Training Settings (3D Optimized) ====================
-    # Reduced workers due to memory constraints
-    NUM_WORKERS = 4           # Fewer workers for 3D (memory intensive)
+    # ==================== HPC Training Settings (64×128×128 Optimized) ====================
+    # Reduced workers due to memory constraints of 64×128×128 volumes
+    NUM_WORKERS = 2           # Further reduced for large 3D volumes (very memory intensive)
     PIN_MEMORY = True
-    PREFETCH_FACTOR = 1       # Reduced prefetch for 3D
-    PERSISTENT_WORKERS = False  # May need to disable for memory
+    PREFETCH_FACTOR = 2       # Minimal prefetch for large 3D volumes
+    PERSISTENT_WORKERS = False  # Disabled for memory with large 3D volumes
     
     # CRITICAL: Gradient accumulation to simulate larger batch sizes
-    GRADIENT_ACCUMULATION_STEPS = 16  # Effective batch size = 16
+    GRADIENT_ACCUMULATION_STEPS = 32  # Effective batch size = 32 (important for stable depth learning)
     
     # Checkpointing
     SAVE_CHECKPOINT_FREQ = 10
-    SAVE_SAMPLE_FREQ = 5      # Less frequent due to slower training
-    LOG_FREQ = 10             # More frequent logging
+    SAVE_SAMPLE_FREQ = 1      # Less frequent due to slower training
+    LOG_FREQ = 1           # More frequent logging
     
     # Resume training
     RESUME_TRAINING = False
     RESUME_CHECKPOINT = None
     
     # ==================== 3D Inference Settings ====================
-    INFERENCE_INPUT_DIR = Path("./data/3d/test")
+    INFERENCE_INPUT_DIR = Path("./data/3d/deep_tissue_test")
     INFERENCE_OUTPUT_DIR = INFERENCE_DIR
     INFERENCE_CHECKPOINT = CHECKPOINT_DIR / "best_model.pth"
     INFERENCE_BATCH_SIZE = 1  # Always 1 for 3D inference
     SAVE_NOISY_INPUT = True
     
-    # 3D tiling for large volumes
-    USE_TILING = True         # Process large volumes in overlapping tiles
-    TILE_DEPTH = 32
-    TILE_HEIGHT = 128
-    TILE_WIDTH = 128
-    TILE_OVERLAP = 16         # Overlap in each dimension
+    # 3D tiling for inference on large volumes (process in 64×128×128 tiles)
+    USE_TILING = True         # Process large volumes in overlapping tiles during inference only
+    TILE_DEPTH = 64           # Match training volume depth
+    TILE_HEIGHT = 128         # Match training dimensions
+    TILE_WIDTH = 128          # 64×128×128 tiles
+    TILE_OVERLAP = 16         # Overlap to avoid edge artifacts
     
     # ==================== Device Settings (3D Optimized) ====================
     if torch.cuda.is_available():
@@ -162,7 +169,7 @@ class Config3D:
     RANDOM_SEED = 42
     
     # ==================== Logging ====================
-    EXPERIMENT_NAME = "cycle_care_3d_hpc"
+    EXPERIMENT_NAME = "cycle_care_3d_64cubes_depth_restoration"
     VERBOSE = True
     USE_TENSORBOARD = True
     
@@ -170,7 +177,7 @@ class Config3D:
     def print_config(cls):
         """Print all configuration parameters."""
         print("\n" + "="*60)
-        print("Cycle-CARE 3D Configuration (HPC Optimized)")
+        print("Cycle-CARE 3D Configuration (64³ Depth Restoration)")
         print("="*60)
         print(f"CUDA Available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():

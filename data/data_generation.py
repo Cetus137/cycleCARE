@@ -82,29 +82,34 @@ def tile_2D_image(image, tile_size, z, overlap , output_path=None):
     """
     tiles = []
     step = tile_size - overlap
+
     if len(image.shape) == 2:
         h, w = image.shape
+        image = image[np.newaxis, ...]  # add a dummy z dimension
     elif len(image.shape) == 3:
         z, h, w = image.shape
 
-    for y in range(0, h - tile_size + 1, step):
-        for x in range(0, w - tile_size + 1, step):
-            tile = image[:, y:y + tile_size, x:x + tile_size]
-            tiles.append(tile)
-            #print(tile.shape)
-            if output_path is not None:
-                tile_filename = f"{output_path}_z{z}_y{y}_x{x}.tif"
-                #remove a tile is it more than 1% zeros
-                print(tile.size)
-                non_zero_ratio = np.count_nonzero(tile) / tile.size
-                print(f"non_zero_ratio: {non_zero_ratio}")
-                if non_zero_ratio < 0.99:
-                    print(f"Removing tile: {tile_filename}")
-                    continue
-                else:
-                    print('tile shape:', tile.shape)
-                    tiff.imwrite(tile_filename, tile.astype(np.float32))
-                #print(f"Saved tile: {tile_filename}")
+    print(image.shape)
+
+    for z in range(image.shape[0]):
+        for y in range(0, h - tile_size + 1, step):
+            for x in range(0, w - tile_size + 1, step):
+                tile = image[z, y:y + tile_size, x:x + tile_size]
+                tiles.append(tile)
+                #print(tile.shape)
+                if output_path is not None:
+                    tile_filename = f"{output_path}_z{z}_y{y}_x{x}.tif"
+                    #remove a tile is it more than 1% zeros
+                    print(tile.size)
+                    non_zero_ratio = np.count_nonzero(tile) / tile.size
+                    print(f"non_zero_ratio: {non_zero_ratio}")
+                    if non_zero_ratio < 0.99:
+                        print(f"Removing tile: {tile_filename}")
+                        continue
+                    else:
+                        print('tile shape:', tile.shape)
+                        tiff.imwrite(tile_filename, tile.astype(np.float32))
+                    #print(f"Saved tile: {tile_filename}")
 
     return tiles
 
@@ -364,11 +369,11 @@ if __name__ == "__main__":
 
     
     path        = r'/users/kir-fritzsche/aif490/devel/raw_data/videos/b2-2a_2c_pos6-01_deskew_cgt.czi'
-    output_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data/node1_z220_256_cropped'
+    output_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/cellpose/new_network/data/node2_tiles'
     T_values = range(0,80)
-    C = 0
-    Z_values = [220, 221]
-    Y_range  = [550, None]
+    C = 1
+    Z_values = [90, 120]
+    Y_range  = [None, None]
     tile_size = 256
     overlap = 16
     #mask_bounds = (186, 186+1860, 363, 363+2088)  # Y1, Y2, X1, X2

@@ -129,11 +129,11 @@ class Volume3DUnpairedDataset(Dataset):
         """
         # Get domain A volume (sequential)
         idx_A = index % len(self.volumes_A)
-        volume_A = self._load_volume(self.volumes_A[idx_A]['path'])
+        volume_A = self._load_volume(self.volumes_A[idx_A]['path'], idx_A)
         
         # Get domain B volume (random for unpaired)
         idx_B = np.random.randint(0, len(self.volumes_B))
-        volume_B = self._load_volume(self.volumes_B[idx_B]['path'])
+        volume_B = self._load_volume(self.volumes_B[idx_B]['path'], idx_B)
         
         return {
             'A': volume_A,
@@ -142,12 +142,13 @@ class Volume3DUnpairedDataset(Dataset):
             'B_path': str(self.volumes_B[idx_B]['path'])
         }
     
-    def _load_volume(self, file_path):
+    def _load_volume(self, file_path, idx=99999):
         """
         Load and process a 3D volume.
         
         Args:
             file_path: Path to TIFF file
+            idx: Volume index for debugging (default 99999 = no debug)
         
         Returns:
             torch.Tensor: [1, D, H, W] normalized tensor
@@ -171,24 +172,38 @@ class Volume3DUnpairedDataset(Dataset):
         else:
             volume = self._resize_volume(volume)
         
-        # Normalize based on dtype
-        if volume.dtype == np.uint16:
-            volume = volume / 65535.0
-        elif volume.dtype == np.uint8:
-            volume = volume / 255.0
-        elif volume.max() > 1.0 or volume.min() < 0.0:
-            # Already float but not in [0, 1]
+        # DEBUG: Print raw data statistics (only for first few volumes)
+        # Save raw stats and a copy for potential debug output later
+        raw_min, raw_max, raw_mean = volume.min(), volume.max(), volume.mean()
+        
+        # Normalize to [0, 1] range
+        # First check if already in [0, 1], otherwise normalize
+        if volume.max() > 1.0 or volume.min() < 0.0:
+            # Float data outside [0, 1] range (e.g., 0-6000 microscopy data)
             if self.use_percentile_norm:
                 p_min = np.percentile(volume, self.percentile_low)
                 p_max = np.percentile(volume, self.percentile_high)
+                
                 if p_max - p_min > 1e-8:
                     volume = (volume - p_min) / (p_max - p_min)
                     volume = np.clip(volume, 0.0, 1.0)
+                else:
+                    # Data has no dynamic range - use min-max normalization
+                    v_min, v_max = volume.min(), volume.max()
+                    if v_max > 1e-8:
+                        volume = (volume - v_min) / (v_max - v_min + 1e-8)
+                    else:
+                        # Truly empty volume
+                        volume = np.zeros_like(volume)
             else:
-                volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-8)
-        
-        # Apply percentile normalization if requested
-        if self.use_percentile_norm and volume.max() <= 1.0:
+                # Min-max normalization
+                v_min, v_max = volume.min(), volume.max()
+                if v_max - v_min > 1e-8:
+                    volume = (volume - v_min) / (v_max - v_min)
+                else:
+                    volume = np.zeros_like(volume)
+        elif self.use_percentile_norm:
+            # Already in [0, 1], but apply percentile norm for consistency
             p_min = np.percentile(volume, self.percentile_low)
             p_max = np.percentile(volume, self.percentile_high)
             if p_max - p_min > 1e-8:
