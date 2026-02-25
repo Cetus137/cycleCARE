@@ -196,7 +196,68 @@ def plot_losses(loss_history, epoch, config):
     print(f"Loss curves saved to {plot_path}")
 
 
-def setup_training(config):
+def plot_iter_losses(iter_history, epoch, config):
+    """
+    Plot per-iteration loss curves (finer resolution than epoch averages).
+    
+    Args:
+        iter_history: List of dicts, one entry per LOG_FREQ iterations across all epochs
+        epoch (int): Current epoch number
+        config: Configuration object
+    """
+    if len(iter_history) < 2:
+        return
+    
+    iters = list(range(1, len(iter_history) + 1))
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(f'Per-Iteration Losses - Epoch {epoch}/{config.NUM_EPOCHS}', fontsize=14, fontweight='bold')
+    
+    # Plot 1: Total generator loss per iteration
+    ax = axes[0, 0]
+    ax.plot(iters, [d['G_total'] for d in iter_history], 'b-', linewidth=0.8, alpha=0.7)
+    ax.set_title('Total Generator Loss (per iter)', fontweight='bold')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Generator adversarial losses
+    ax = axes[0, 1]
+    ax.plot(iters, [d['G_AB'] for d in iter_history], 'g-', linewidth=0.8, alpha=0.7, label='G_AB (Surface→Deep)')
+    ax.plot(iters, [d['G_BA'] for d in iter_history], 'm-', linewidth=0.8, alpha=0.7, label='G_BA (Deep→Surface)')
+    ax.set_title('Generator Adversarial Losses (per iter)', fontweight='bold')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    
+    # Plot 3: Cycle consistency losses
+    ax = axes[1, 0]
+    ax.plot(iters, [d['cycle_A'] for d in iter_history], 'c-', linewidth=0.8, alpha=0.7, label='Cycle A')
+    ax.plot(iters, [d['cycle_B'] for d in iter_history], 'orange', linewidth=0.8, alpha=0.7, label='Cycle B (Restoration)')
+    ax.set_title('Cycle Consistency Losses (per iter)', fontweight='bold')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    
+    # Plot 4: Discriminator losses — most informative for collapse detection
+    ax = axes[1, 1]
+    ax.plot(iters, [d['D_A'] for d in iter_history], 'brown', linewidth=0.8, alpha=0.7, label='D_A (Surface)')
+    ax.plot(iters, [d['D_B'] for d in iter_history], 'olive', linewidth=0.8, alpha=0.7, label='D_B (Deep)')
+    ax.axhline(y=0.25, color='k', linestyle='--', alpha=0.4, linewidth=1, label='Random baseline (0.25)')
+    ax.axhline(y=0.05, color='r', linestyle='--', alpha=0.4, linewidth=1, label='Collapse threshold (0.05)')
+    ax.set_title('Discriminator Losses (per iter)', fontweight='bold')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    
+    plt.tight_layout()
+    plot_path = config.OUTPUT_ROOT / 'loss_curves_iter.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Per-iter loss curves saved to {plot_path}")
     """
     Setup model, optimizers, and training utilities for HPC.
     
@@ -256,13 +317,13 @@ def setup_training(config):
     
     optimizer_D_A = torch.optim.Adam(
         model_ref.D_A.parameters(),
-        lr=config.LEARNING_RATE,
+        lr=config.LEARNING_RATE_D,
         betas=(config.BETA1, config.BETA2)
     )
     
     optimizer_D_B = torch.optim.Adam(
         model_ref.D_B.parameters(),
-        lr=config.LEARNING_RATE,
+        lr=config.LEARNING_RATE_D,
         betas=(config.BETA1, config.BETA2)
     )
     
@@ -277,9 +338,9 @@ def setup_training(config):
     if config.MIXED_PRECISION:
         print("Mixed precision training enabled (FP16)")
     
-    # Create image pools to store generated images
-    fake_A_pool = ImagePool(pool_size=50)
-    fake_B_pool = ImagePool(pool_size=50)
+    # Create image pools to store generated images (200 keeps broader history, reduces mode cycling)
+    fake_A_pool = ImagePool(pool_size=200)
+    fake_B_pool = ImagePool(pool_size=200)
     image_pools = {'A': fake_A_pool, 'B': fake_B_pool}
     
     # Create loss manager
@@ -327,6 +388,7 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
     
     num_iters = len(train_loader)
     start_time = time.time()
+    iter_losses = []  # per-iteration losses for fine-grained plotting
     
     for i, batch in enumerate(train_loader):
         iter_start_time = time.time()
@@ -409,16 +471,45 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
             loss_D_B.backward()
             optimizers['D_B'].step()
         
+        # ===================== Second Generator Update (2:1 G:D ratio) =====================
+        # G gets a second update responding to the freshly-updated discriminators,
+        # preventing D from building up too large an advantage in a single iteration.
+        set_requires_grad([model_ref.D_A, model_ref.D_B], False)
+        optimizers['G'].zero_grad()
+        
+        if config.MIXED_PRECISION:
+            with autocast():
+                loss_G2, loss_dict_G2 = loss_manager.compute_generator_loss(
+                    model, real_A, real_B, model_ref.D_A, model_ref.D_B
+                )
+            scaler.scale(loss_G2).backward()
+            scaler.step(optimizers['G'])
+            scaler.update()
+        else:
+            loss_G2, loss_dict_G2 = loss_manager.compute_generator_loss(
+                model, real_A, real_B, model_ref.D_A, model_ref.D_B
+            )
+            loss_G2.backward()
+            optimizers['G'].step()
+        
         # ===================== Update Meters =====================
-        meters['G_total'].update(loss_dict_G['G_total'])
-        meters['G_AB'].update(loss_dict_G['G_AB'])
-        meters['G_BA'].update(loss_dict_G['G_BA'])
-        meters['cycle_A'].update(loss_dict_G['cycle_A'])
-        meters['cycle_B'].update(loss_dict_G['cycle_B'])
-        meters['identity_A'].update(loss_dict_G['identity_A'])
-        meters['identity_B'].update(loss_dict_G['identity_B'])
+        # Average both G update steps in the meters
+        for key in ['G_total', 'G_AB', 'G_BA', 'cycle_A', 'cycle_B', 'identity_A', 'identity_B']:
+            meters[key].update((loss_dict_G[key] + loss_dict_G2[key]) / 2)
         meters['D_A'].update(loss_dict_D['D_A_total'])
         meters['D_B'].update(loss_dict_D['D_B_total'])
+        
+        # Collect per-iteration losses (every LOG_FREQ iters to limit memory)
+        if (i + 1) % config.LOG_FREQ == 0 or (i + 1) == num_iters:
+            iter_losses.append({
+                'G_total': (loss_dict_G['G_total'] + loss_dict_G2['G_total']) / 2,
+                'G_AB':    (loss_dict_G['G_AB']    + loss_dict_G2['G_AB'])    / 2,
+                'G_BA':    (loss_dict_G['G_BA']    + loss_dict_G2['G_BA'])    / 2,
+                'cycle_A': (loss_dict_G['cycle_A'] + loss_dict_G2['cycle_A']) / 2,
+                'cycle_B': (loss_dict_G['cycle_B'] + loss_dict_G2['cycle_B']) / 2,
+                'D_A': loss_dict_D['D_A_total'],
+                'D_B': loss_dict_D['D_B_total'],
+            })
         
         # ===================== Logging =====================
         if (i + 1) % config.LOG_FREQ == 0 or (i + 1) == num_iters:
@@ -438,8 +529,8 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
     epoch_time = time.time() - start_time
     print(f"\nEpoch {epoch} completed in {epoch_time:.2f}s ({epoch_time/60:.1f} min)")
     
-    # Return average losses
-    return {key: meter.avg for key, meter in meters.items()}
+    # Return average losses AND per-iteration losses
+    return {key: meter.avg for key, meter in meters.items()}, iter_losses
 
 
 def save_3d_comparison_grid(real_A, fake_B, reconstructed_A, real_B, fake_A, reconstructed_B,
@@ -513,12 +604,12 @@ def validate(model, val_loader, loss_manager, epoch, config, writer=None):
             if config.MIXED_PRECISION:
                 with autocast():
                     outputs = model(real_A=real_A, real_B=real_B, mode='full')
-                    cycle_loss_A = loss_manager.cycle_loss(outputs['reconstructed_A'], real_A)
-                    cycle_loss_B = loss_manager.cycle_loss(outputs['reconstructed_B'], real_B)
+                    cycle_loss_A = loss_manager.cycle_loss(outputs['reconstructed_A'], real_A) * loss_manager.lambda_cycle
+                    cycle_loss_B = loss_manager.cycle_loss(outputs['reconstructed_B'], real_B) * loss_manager.lambda_cycle
             else:
                 outputs = model(real_A=real_A, real_B=real_B, mode='full')
-                cycle_loss_A = loss_manager.cycle_loss(outputs['reconstructed_A'], real_A)
-                cycle_loss_B = loss_manager.cycle_loss(outputs['reconstructed_B'], real_B)
+                cycle_loss_A = loss_manager.cycle_loss(outputs['reconstructed_A'], real_A) * loss_manager.lambda_cycle
+                cycle_loss_B = loss_manager.cycle_loss(outputs['reconstructed_B'], real_B) * loss_manager.lambda_cycle
             
             meters['cycle_A'].update(cycle_loss_A.item())
             meters['cycle_B'].update(cycle_loss_B.item())
@@ -594,6 +685,7 @@ def train(config):
             'cycle_A': [], 'cycle_B': []
         }
     }
+    iter_history = []  # per-iteration losses across all epochs
     
     # Resume training if specified
     start_epoch = 1
@@ -615,6 +707,9 @@ def train(config):
         if 'loss_history' in checkpoint:
             loss_history = checkpoint['loss_history']
             print(f"Restored loss history from checkpoint")
+        if 'iter_history' in checkpoint:
+            iter_history = checkpoint['iter_history']
+            print(f"Restored iter history ({len(iter_history)} entries) from checkpoint")
         
         print(f"Resumed from epoch {start_epoch-1}")
     
@@ -631,19 +726,24 @@ def train(config):
         print(f"{'='*60}")
         
         # Update learning rate (linear decay after certain epoch)
+        # G and D decay separately to preserve the G:D LR ratio
         if epoch > config.LR_DECAY_START_EPOCH:
             decay_epochs = config.LR_DECAY_END_EPOCH - config.LR_DECAY_START_EPOCH
             decay_progress = (epoch - config.LR_DECAY_START_EPOCH) / decay_epochs
-            new_lr = config.LEARNING_RATE * (1.0 - decay_progress)
-            for optimizer in optimizers.values():
-                update_learning_rate(optimizer, new_lr)
-            print(f"Learning rate: {new_lr:.6f}")
+            scale = 1.0 - decay_progress
+            new_lr_G = config.LEARNING_RATE * scale
+            new_lr_D = config.LEARNING_RATE_D * scale
+            update_learning_rate(optimizers['G'], new_lr_G)
+            update_learning_rate(optimizers['D_A'], new_lr_D)
+            update_learning_rate(optimizers['D_B'], new_lr_D)
+            print(f"Learning rate — G: {new_lr_G:.2e}, D: {new_lr_D:.2e}")
         
         # Train
-        train_losses = train_epoch(
+        train_losses, new_iter_losses = train_epoch(
             model, train_loader, optimizers, image_pools, loss_manager,
             epoch, config, scaler, writer
         )
+        iter_history.extend(new_iter_losses)
         
         # Validate
         val_losses = validate(model, val_loader, loss_manager, epoch, config, writer)
@@ -658,6 +758,7 @@ def train(config):
         
         # Plot loss curves (replaces previous plot)
         plot_losses(loss_history, epoch, config)
+        plot_iter_losses(iter_history, epoch, config)
         
         # Save checkpoint
         if epoch % config.SAVE_CHECKPOINT_FREQ == 0:
@@ -674,7 +775,8 @@ def train(config):
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
-                'loss_history': loss_history,  # Save loss history
+                'loss_history': loss_history,
+                'iter_history': iter_history[-5000:],  # keep last 5000 entries (~few epochs)
                 'config': config_to_dict(config)  # Save as dict for proper serialization
             }, checkpoint_path)
         
@@ -694,7 +796,8 @@ def train(config):
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'best_val_loss': best_val_loss,
-                'loss_history': loss_history,  # Save loss history to best model too
+                'loss_history': loss_history,
+                'iter_history': iter_history[-5000:],
                 'config': config_to_dict(config)
             }, best_model_path)
             print(f"Saved best model (val_loss: {best_val_loss:.4f})")

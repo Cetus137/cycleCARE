@@ -705,8 +705,8 @@ class CycleCarelosses:
         ssim_window_2d = getattr(config, 'SSIM_WINDOW', 7)
         ssim_window_3d = getattr(config, 'SSIM3D_WINDOW', 5)
         
-        # Initialize loss functions
-        self.gan_loss = GANLoss(gan_mode='lsgan').to(device)
+        # Initialize loss functions (0.9 real label = label smoothing, prevents D from reaching zero loss)
+        self.gan_loss = GANLoss(gan_mode='lsgan', target_real_label=0.9).to(device)
         self.cycle_loss = CycleConsistencyLoss(
             loss_type=cycle_loss_type, 
             ssim_weight=ssim_weight, 
@@ -761,8 +761,9 @@ class CycleCarelosses:
         Returns:
             tuple: (total_loss, loss_dict)
         """
-        # Forward pass
-        outputs = model(real_A=real_A, real_B=real_B, mode='full')
+        # Forward pass — skip identity if lambda=0 to save 2 forward passes
+        compute_identity = self.lambda_identity > 0
+        outputs = model(real_A=real_A, real_B=real_B, mode='full', compute_identity=compute_identity)
         
         fake_A = outputs['fake_A']
         fake_B = outputs['fake_B']
@@ -786,9 +787,13 @@ class CycleCarelosses:
         loss_cycle_A = self.cycle_loss(reconstructed_A, real_A) * self.lambda_cycle
         loss_cycle_B = self.cycle_loss(reconstructed_B, real_B) * self.lambda_cycle
         
-        # Identity loss (optional)
-        loss_identity_A = self.identity_loss(identity_A, real_A) * self.lambda_identity
-        loss_identity_B = self.identity_loss(identity_B, real_B) * self.lambda_identity
+        # Identity loss (optional - skipped entirely when lambda=0)
+        if self.lambda_identity > 0:
+            loss_identity_A = self.identity_loss(identity_A, real_A) * self.lambda_identity
+            loss_identity_B = self.identity_loss(identity_B, real_B) * self.lambda_identity
+        else:
+            loss_identity_A = torch.tensor(0.0, device=real_A.device)
+            loss_identity_B = torch.tensor(0.0, device=real_A.device)
         
         # Total generator loss
         total_loss = (loss_G_BA + loss_G_AB + 

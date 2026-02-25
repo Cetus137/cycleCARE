@@ -83,7 +83,7 @@ class CycleCARE3D(nn.Module):
             use_batch_norm=use_batch_norm
         )
     
-    def forward(self, real_A=None, real_B=None, mode='full'):
+    def forward(self, real_A=None, real_B=None, mode='full', **kwargs):
         """
         Forward pass through the Cycle-CARE 3D model.
         
@@ -113,9 +113,14 @@ class CycleCARE3D(nn.Module):
             reconstructed_A = self.G_BA(fake_B)  # A → B → A
             reconstructed_B = self.G_AB(fake_A)  # B → A → B
             
-            # Identity mapping
-            identity_A = self.G_BA(real_A)  # Should preserve clean
-            identity_B = self.G_AB(real_B)  # Should preserve noisy
+            # Identity mapping (only if requested - skipping saves 2 forward passes)
+            compute_identity = kwargs.get('compute_identity', True)
+            if compute_identity:
+                identity_A = self.G_BA(real_A)  # Should preserve clean
+                identity_B = self.G_AB(real_B)  # Should preserve noisy
+            else:
+                identity_A = None
+                identity_B = None
             
             outputs = {
                 'fake_A': fake_A,

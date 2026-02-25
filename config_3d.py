@@ -24,7 +24,7 @@ class Config3D:
     VAL_B_DIR = DATA_ROOT / "valB"                        # Validation degraded deep volumes
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_3d_subset_long_A100")
+    OUTPUT_ROOT = Path("./outputs_3d_subset_long_A100_node2_Identity")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -56,16 +56,16 @@ class Config3D:
     
     # ==================== Training Parameters (64³ Optimized) ====================
     # CRITICAL: 64³ volumes are ~3× larger than 5×128×128, requires batch_size=1
-    BATCH_SIZE = 2            # Maximum for 64³ volumes on most GPUs
+    BATCH_SIZE = 1            # Maximum for 64³ volumes on most GPUs
     NUM_EPOCHS = 50          # More epochs for depth degradation learning
-    LEARNING_RATE = 2e-4      # Standard learning rate
-    LEARNING_RATE_D = 2e-4    # Discriminator learning rate (balanced for depth features)
+    LEARNING_RATE = 2e-4      # Generator learning rate
+    LEARNING_RATE_D = 5e-5    # Discriminator LR — lower than G to prevent D from winning too fast
     BETA1 = 0.5
     BETA2 = 0.999
     
     # Loss weights - optimized for depth-dependent restoration
     LAMBDA_CYCLE = 20.0       # High cycle consistency to preserve depth coherence
-    LAMBDA_IDENTITY = 0.5     # Lower identity to allow stronger restoration
+    LAMBDA_IDENTITY = 1.0     # 0 = skip identity forward passes entirely (saves 2/6 gen passes)
     LAMBDA_ADV = 5.0          # Balanced adversarial weight
     
     # Loss types - optimized for depth restoration
@@ -73,7 +73,7 @@ class Config3D:
     # - 'l2': Mean Squared Error (pixel-wise, sensitive to outliers, can blur)
     # - 'ssim': Structural Similarity (perceptual, preserves texture/structure)
     # - 'combined': 3D SSIM + L1 + Gradient (best for depth-dependent features)
-    CYCLE_LOSS_TYPE = 'combined'     # Combined loss preserves 3D structure across depth
+    CYCLE_LOSS_TYPE = 'l1'     # 'l1' is much faster than 'combined' (no 3D SSIM/gradient cost)
     IDENTITY_LOSS_TYPE = 'l1'        # L1 for identity
     
     # Weights for combined loss - balanced for depth coherence
