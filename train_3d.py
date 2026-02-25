@@ -258,6 +258,9 @@ def plot_iter_losses(iter_history, epoch, config):
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Per-iter loss curves saved to {plot_path}")
+
+
+def setup_training(config):
     """
     Setup model, optimizers, and training utilities for HPC.
     
