@@ -15,16 +15,16 @@ class Config3D:
     USE_3D_MODEL = True   # Enable full 3D volumetric processing
     
     # ==================== Paths ====================
-    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data_3D")
+    DATA_ROOT = Path("/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data_3D_node2")
     
     # 3D volume directories
-    TRAIN_A_DIR = DATA_ROOT / "surface"     # Clean surface volumes (Z=0-64)
-    TRAIN_B_DIR = DATA_ROOT / "deep"        # Degraded deep volumes (Z=64-128)
+    TRAIN_A_DIR = DATA_ROOT / "surface_subset"     # Clean surface volumes (Z=0-64)
+    TRAIN_B_DIR = DATA_ROOT / "deep_subset"        # Degraded deep volumes (Z=64-128)
     VAL_A_DIR = DATA_ROOT / "valA"                        # Validation clean surface volumes
     VAL_B_DIR = DATA_ROOT / "valB"                        # Validation degraded deep volumes
     
     # Output directories
-    OUTPUT_ROOT = Path("./outputs_3d_subset_long_A100_node2_Identity")
+    OUTPUT_ROOT = Path("./outputs_3d_subset_long_A100_node2_Identity_subset")
     CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
     LOG_DIR = OUTPUT_ROOT / "logs"
     SAMPLE_DIR = OUTPUT_ROOT / "samples"
@@ -63,6 +63,10 @@ class Config3D:
     BETA1 = 0.5
     BETA2 = 0.999
     
+    # Generator / Discriminator update ratio
+    # 1 = standard 1:1, 2 = two G updates per D update (helps when D dominates)
+    GENERATOR_UPDATES_PER_ITER = 1
+
     # Loss weights - optimized for depth-dependent restoration
     LAMBDA_CYCLE = 20.0       # High cycle consistency to preserve depth coherence
     LAMBDA_IDENTITY = 1.0     # 0 = skip identity forward passes entirely (saves 2/6 gen passes)

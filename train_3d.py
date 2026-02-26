@@ -474,29 +474,30 @@ def train_epoch(model, train_loader, optimizers, image_pools, loss_manager,
             loss_D_B.backward()
             optimizers['D_B'].step()
         
-        # ===================== Second Generator Update (2:1 G:D ratio) =====================
-        # G gets a second update responding to the freshly-updated discriminators,
-        # preventing D from building up too large an advantage in a single iteration.
-        set_requires_grad([model_ref.D_A, model_ref.D_B], False)
-        optimizers['G'].zero_grad()
-        
-        if config.MIXED_PRECISION:
-            with autocast():
+        # ===================== Second Generator Update (optional, config.GENERATOR_UPDATES_PER_ITER >= 2) =====================
+        if config.GENERATOR_UPDATES_PER_ITER >= 2:
+            set_requires_grad([model_ref.D_A, model_ref.D_B], False)
+            optimizers['G'].zero_grad()
+
+            if config.MIXED_PRECISION:
+                with autocast():
+                    loss_G2, loss_dict_G2 = loss_manager.compute_generator_loss(
+                        model, real_A, real_B, model_ref.D_A, model_ref.D_B
+                    )
+                scaler.scale(loss_G2).backward()
+                scaler.step(optimizers['G'])
+                scaler.update()
+            else:
                 loss_G2, loss_dict_G2 = loss_manager.compute_generator_loss(
                     model, real_A, real_B, model_ref.D_A, model_ref.D_B
                 )
-            scaler.scale(loss_G2).backward()
-            scaler.step(optimizers['G'])
-            scaler.update()
+                loss_G2.backward()
+                optimizers['G'].step()
         else:
-            loss_G2, loss_dict_G2 = loss_manager.compute_generator_loss(
-                model, real_A, real_B, model_ref.D_A, model_ref.D_B
-            )
-            loss_G2.backward()
-            optimizers['G'].step()
-        
+            loss_G2, loss_dict_G2 = loss_dict_G, loss_dict_G  # reuse first update for meters
+
         # ===================== Update Meters =====================
-        # Average both G update steps in the meters
+        # Average both G update steps in the meters (same values when GENERATOR_UPDATES_PER_ITER=1)
         for key in ['G_total', 'G_AB', 'G_BA', 'cycle_A', 'cycle_B', 'identity_A', 'identity_B']:
             meters[key].update((loss_dict_G[key] + loss_dict_G2[key]) / 2)
         meters['D_A'].update(loss_dict_D['D_A_total'])
