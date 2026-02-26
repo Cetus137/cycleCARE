@@ -294,14 +294,13 @@ def setup_training(config):
         dropout_rate=config.DROPOUT_RATE
     )
     
-    # torch.compile — compile each submodule individually to avoid graph breaks
-    # from the Python control flow in CycleCARE3D.forward()
+    # torch.compile — generators only. Discriminators use set_requires_grad() mid-loop
+    # which causes torch.compile to cache the wrong grad trace on first call (during
+    # generator training with D frozen), breaking discriminator backward passes.
     if getattr(config, 'USE_TORCH_COMPILE', False):
-        print("Compiling submodules with torch.compile (first epoch will be slower)...")
+        print("Compiling generators with torch.compile (first epoch will be slower)...")
         model.G_AB = torch.compile(model.G_AB)
         model.G_BA = torch.compile(model.G_BA)
-        model.D_A  = torch.compile(model.D_A)
-        model.D_B  = torch.compile(model.D_B)
 
     # Multi-GPU support
     if config.MULTI_GPU and torch.cuda.device_count() > 1:
