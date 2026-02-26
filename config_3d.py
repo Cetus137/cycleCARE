@@ -159,7 +159,11 @@ class Config3D:
     
     # ESSENTIAL for 3D training
     MIXED_PRECISION = True    # FP16 is critical for 3D memory usage
-    GRADIENT_CHECKPOINTING = True  # Trade compute for memory
+    GRADIENT_CHECKPOINTING = False  # NOTE: not yet implemented in model/train — has no effect currently
+
+    # torch.compile (PyTorch >= 2.0): fuses 3D conv ops for 10-30% throughput gain.
+    # First epoch will be slow (compilation). Disable if using gradient checkpointing or multi-GPU.
+    USE_TORCH_COMPILE = False
     
     # Multi-GPU (if available) - use DataParallel for 3D
     MULTI_GPU = torch.cuda.device_count() > 1

@@ -294,6 +294,11 @@ def setup_training(config):
         dropout_rate=config.DROPOUT_RATE
     )
     
+    # torch.compile — compile before DataParallel for best results
+    if getattr(config, 'USE_TORCH_COMPILE', False):
+        print("Compiling model with torch.compile (first epoch will be slower)...")
+        model = torch.compile(model)
+
     # Multi-GPU support
     if config.MULTI_GPU and torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
